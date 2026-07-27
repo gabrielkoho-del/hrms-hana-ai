@@ -1,0 +1,105 @@
+# HRMS Tenant Group Mappings
+# Each tenant maps their external IDP groups to internal HRMS roles
+
+tenants:
+  # ─── PRODUCTION TENANTS ─────────────────────────────────────────
+  XYZ:
+    name: "XYZ Corporation"
+    dab_url: "http://dab-xyz:5000"
+    idp_type: azure_ad
+    idp_issuer: "https://login.microsoftonline.com/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx/v2.0"
+
+    group_mappings:
+      # external_group: internal_role
+      "Human Resources Team": HRMS_HR
+      "Regional Managers": HRMS_MANAGER
+      "Employees": HRMS_EMPLOYEE
+
+    # Optional: override permissions per tenant
+    permissions_override: {}
+
+  PETRONAS:
+    name: "Petronas Berhad"
+    dab_url: "http://dab-petronas:5000"
+    idp_type: okta
+    idp_issuer: "https://petronas.okta.com"
+
+    group_mappings:
+      "PeopleOps": HRMS_HR
+      "TeamLeads": HRMS_MANAGER
+      "Staff": HRMS_EMPLOYEE
+
+  # Add new tenants by copying the block above
+  # DEMO_TENANT:
+  #   name: "Demo Company"
+  #   idp_type: azure_ad
+  #   group_mappings:
+  #     "HR Admins": HRMS_HR
+  #     "All Staff": HRMS_EMPLOYEE
+
+
+  # ─── LOCAL TEST TENANT ────────────────────────────────────────────
+  # Use this for local development/testing without Azure AD/Okta
+  # Generate a test JWT with: tenant_id=LOCALDEV, groups=["TestHR"]
+  LOCALDEV:
+    name: "Local Development"
+    dab_url: "http://localhost:5000"
+    idp_type: test
+    idp_issuer: "localdev"
+    mode: development
+    group_mappings:
+      "TestHR": HRMS_HR
+      "TestEmployee": HRMS_EMPLOYEE
+      "TestManager": HRMS_MANAGER
+      "TestAdmin": HRMS_HR           # Admin = HR role for now
+
+
+
+   # ─── LOCAL TEST RDEMOROCKFORT ────────────────────────────────────────────
+  # Use this for local development/testing with rDemoRockfort DB
+  # Generate a test JWT with: tenant_id=RDEMOROCKFORT, groups=["rockfortHR"]
+  RDEMOROCKFORT:
+    name: "Local Development (rDemoRockfort)"
+    dab_url: "http://localhost:5001"
+    idp_type: test
+    idp_issuer: "localdev"
+    mode: development
+    group_mappings:
+      "rockfortHR": HRMS_HR
+      "rockfortEmployee": HRMS_EMPLOYEE
+      "rockfortManager": HRMS_MANAGER
+      "rockfortAdmin": HRMS_HR
+
+
+# Default role when no mapping matches (null = deny access)
+default_role: null
+
+
+# Internal role definitions and base permissions
+roles:
+  HRMS_HR:
+    description: "Full HR access - can read/write all employee data"
+    permissions:
+      - read:all_employees
+      - write:all_employees
+      - read:salary
+      - write:salary
+      - read:org_hierarchy
+      - run_safe_query
+      - admin:manage_mappings   # Can edit mappings for their tenant
+
+  HRMS_MANAGER:
+    description: "Manager access - subordinates only"
+    permissions:
+      - read:subordinates
+      - write:subordinates
+      - read:subordinate_salary
+      - read:org_hierarchy
+      - run_safe_query
+
+  HRMS_EMPLOYEE:
+    description: "Self-service access"
+    permissions:
+      - read:self
+      - read:org_hierarchy
+      - run_safe_query

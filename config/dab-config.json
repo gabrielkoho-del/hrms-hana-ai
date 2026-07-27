@@ -1,0 +1,121 @@
+{
+  "$schema": "https://github.com/Azure/data-api-builder/releases/download/v2.0.8/dab.draft.schema.json",
+  "data-source": {
+    "database-type": "mssql",
+    "connection-string": "Server=localhost;Database=HRMSlocal;Trusted_Connection=True;TrustServerCertificate=True;Encrypt=False;"
+  },
+  "runtime": {
+    "rest": {
+      "enabled": true,
+      "path": "/api",
+      "request-body-strict": false
+    },
+    "graphql": {
+      "enabled": true,
+      "path": "/graphql",
+      "allow-introspection": true
+    },
+    "mcp": {
+      "enabled": true,
+      "path": "/mcp"
+    },
+    "host": {
+      "cors": {
+        "origins": [],
+        "allow-credentials": false
+      },
+      "authentication": {
+        "provider": "Unauthenticated"
+      },
+      "mode": "development"
+    },
+    "telemetry": {
+	  "open-telemetry": {
+	 	 "enabled": true,
+	 	 "endpoint": "@env('OTEL_EXPORTER_OTLP_ENDPOINT')",
+	 	 "headers": "@env('OTEL_EXPORTER_OTLP_HEADERS')",
+	 	 "service-name": "@env('OTEL_SERVICE_NAME')"
+	  },
+	  "log-level": {
+	 	 "default": "Warning",
+	 	 "Azure.DataApiBuilder.Core.Resolvers.SqlQueryEngine": "Debug",
+	 	 "Azure.DataApiBuilder.Core.Resolvers.IQueryExecutor": "Debug",
+	 	 "Microsoft.AspNetCore": "Warning"
+	  }
+}
+  },
+  "entities": {
+    "Employees": {
+      "description": "Employee directory with personal info, job details, salary, department and other general info",
+      "source": {
+        "object": "dbo.employee",
+        "type": "table"
+      },
+      "fields": [
+        { "name": "emp_id", "type": "Int", "nullable": false },
+        { "name": "first_name", "type": "String", "nullable": false },
+        { "name": "last_name", "type": "String", "nullable": false },
+        { "name": "email", "type": "String", "nullable": true },
+        { "name": "phone", "type": "String", "nullable": true },
+        { "name": "department", "type": "String", "nullable": true },
+        { "name": "job_title", "type": "String", "nullable": true },
+        { "name": "salary", "type": "Decimal", "nullable": true },
+        { "name": "age", "type": "Int", "nullable": true },
+        { "name": "hire_date", "type": "Date", "nullable": true },
+        { "name": "employment_status", "type": "String", "nullable": true },
+        { "name": "gender", "type": "String", "nullable": true },
+        { "name": "location", "type": "String", "nullable": true },
+        { "name": "manager_id", "type": "Int", "nullable": true },
+        { "name": "employment_type", "type": "String", "nullable": true },
+        { "name": "skills", "type": "String", "nullable": true },
+        { "name": "performance_rating", "type": "Int", "nullable": true },
+        { "name": "education", "type": "String", "nullable": true },
+        { "name": "job_level", "type": "String", "nullable": true },
+        { "name": "marital_status", "type": "String", "nullable": true },
+        { "name": "race_ethnicity", "type": "String", "nullable": true },
+        { "name": "years_of_service", "type": "Int", "nullable": true }
+      ],
+      "graphql": { "enabled": true, "type": { "singular": "Employees", "plural": "Employees" } },
+      "rest": { "enabled": true },
+      "permissions": [{ "role": "anonymous", "actions": [{ "action": "read" }] }]
+    },
+    "LeaveEntitlements": {
+      "description": "Annual leave entitlements, accrued days, taken days, and balance by employee and leave type",
+      "source": { "object": "dbo.leave_entitlement", "type": "table" },
+      "fields": [
+        { "name": "entitlement_id", "type": "Int", "nullable": false },
+        { "name": "emp_id", "type": "Int", "nullable": false },
+        { "name": "leave_type", "type": "String", "nullable": false },
+        { "name": "year", "type": "Int", "nullable": false },
+        { "name": "entitled_days", "type": "Decimal", "nullable": false },
+        { "name": "carried_forward", "type": "Decimal", "nullable": false },
+        { "name": "taken_days", "type": "Decimal", "nullable": false },
+        { "name": "forfeited_days", "type": "Decimal", "nullable": false },
+        { "name": "balance_days", "type": "Decimal", "nullable": true }
+      ],
+      "graphql": { "enabled": true, "type": { "singular": "LeaveEntitlements", "plural": "LeaveEntitlements" } },
+      "rest": { "enabled": true },
+      "permissions": [{ "role": "anonymous", "actions": [{ "action": "read" }] }]
+    },
+    "EmployeeLeaves": {
+      "description": "Employee leave requests, approval status, dates, and leave history",
+      "source": { "object": "dbo.employee_leave", "type": "table" },
+      "fields": [
+        { "name": "leave_id", "type": "Int", "nullable": false },
+        { "name": "emp_id", "type": "Int", "nullable": false },
+        { "name": "leave_type", "type": "String", "nullable": true },
+        { "name": "start_date", "type": "Date", "nullable": false },
+        { "name": "end_date", "type": "Date", "nullable": false },
+        { "name": "days_requested", "type": "Int", "nullable": true },
+        { "name": "status", "type": "String", "nullable": true },
+        { "name": "reason", "type": "String", "nullable": true },
+        { "name": "approved_by", "type": "Int", "nullable": true },
+        { "name": "requested_at", "type": "DateTime", "nullable": true },
+        { "name": "approved_at", "type": "DateTime", "nullable": true }
+      ],
+      "graphql": { "enabled": true, "type": { "singular": "EmployeeLeaves", "plural": "EmployeeLeaves" } },
+      "rest": { "enabled": true },
+      "permissions": [{ "role": "anonymous", "actions": [{ "action": "read" }] }]
+    }
+  }
+}

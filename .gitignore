@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+venv311/
+.venv/
+env/
+ENV/
+
+# Node.js
+node_modules/
+
+# Data / Runtime
+chroma_db/
+data/
+.kilo/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Secrets
+config/.env
+*.env
+
+# External dependency (cloned separately)
+hana-mcp-server/
+
+# Design assets (per your request)
+workflow_*.png

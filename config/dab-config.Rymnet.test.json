@@ -1,0 +1,153 @@
+{
+  "$schema": "https://github.com/Azure/data-api-builder/releases/download/v2.0.8/dab.draft.schema.json",
+  "data-source": {
+    "database-type": "mssql",
+    "connection-string": "Server=rym02.database.windows.net;Database=rDemoRockfort;User Id=Gabriel;Password=Rymnet@1234!;Encrypt=True;TrustServerCertificate=False;"
+  },
+  "runtime": {
+    "rest": {
+      "enabled": true,
+      "path": "/api",
+      "request-body-strict": false
+    },
+    "graphql": {
+      "enabled": true,
+      "path": "/graphql",
+      "allow-introspection": true
+    },
+    "mcp": {
+      "enabled": true,
+      "path": "/mcp",
+      "dml-tools": {
+        "describe-entities": true,
+        "create-record": true,
+        "read-records": true,
+        "update-record": true,
+        "delete-record": true,
+        "execute-entity": true,
+        "aggregate-records": true
+      }
+    },
+    "host": {
+      "cors": {
+        "origins": [],
+        "allow-credentials": false
+      },
+      "authentication": {
+        "provider": "Unauthenticated"
+      },
+      "mode": "development"
+    },
+    "telemetry": {
+      "open-telemetry": {
+        "enabled": true,
+        "endpoint": "@env('OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4317')",
+        "headers": "@env('OTEL_EXPORTER_OTLP_HEADERS', '')",
+        "service-name": "@env('OTEL_SERVICE_NAME', 'hrms-dab')"
+      },
+      "log-level": {
+        "default": "warning",
+        "Azure.DataApiBuilder.Core.Resolvers.SqlQueryEngine": "debug",
+        "Azure.DataApiBuilder.Core.Resolvers.IQueryExecutor": "debug",
+        "Microsoft.AspNetCore": "warning"
+      }
+    }
+  },
+  "autoentities": {},
+  "entities": {
+    "V_EMP": {
+      "description": "Master employee view covering core demographics, employment lifecycle, job/position data, compensation, HR event tracking, and emergency contacts across HK and MY entities.",
+      "source": {
+        "object": "dbo.v_emp",
+        "type": "view"
+      },
+      "fields": [
+        {
+          "name": "ID",
+          "primary-key": true
+        }
+      ],
+      "graphql": {
+        "enabled": true,
+        "type": {
+          "singular": "V_EMP",
+          "plural": "V_EMPs"
+        }
+      },
+      "rest": {
+        "enabled": true
+      },
+      "permissions": [
+        {
+          "role": "anonymous",
+          "actions": [
+            {
+              "action": "read"
+            }
+          ]
+        }
+      ]
+    },
+    "codesetup": {
+      "description": "Code-to-description lookup table for HR codes (status, department, gender, etc.)",
+      "source": {
+        "object": "dbo.codesetup",
+        "type": "table"
+      },
+      "graphql": {
+        "enabled": true,
+        "type": {
+          "singular": "codesetup",
+          "plural": "codesetups"
+        }
+      },
+      "rest": {
+        "enabled": true
+      },
+      "permissions": [
+        {
+          "role": "anonymous",
+          "actions": [
+            {
+              "action": "read"
+            }
+          ]
+        }
+      ],
+      "mappings": {
+        "id": "ID",
+        "code": "CODE",
+        "type": "TYPE",
+        "description": "DESCRIPTION",
+        "active": "ACTIVE"
+      }
+    },
+    "employee_compensation": {
+      "description": "Employee master table storing personal profiles, statutory contribution configurations (EPF, SOCSO, EIS, tax, zakat, HRDF), banking details, work schedule settings, and payroll flags. Referenced by payroll processing and HR analytics queries.",
+      "source": {
+        "object": "dbo.employee_compensation",
+        "type": "table"
+      },
+      "graphql": {
+        "enabled": true,
+        "type": {
+          "singular": "employee_compensation",
+          "plural": "employee_compensations"
+        }
+      },
+      "rest": {
+        "enabled": true
+      },
+      "permissions": [
+        {
+          "role": "anonymous",
+          "actions": [
+            {
+              "action": "read"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

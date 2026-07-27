@@ -1,0 +1,27 @@
+{
+  "runtime": {
+    "host": {
+      "mode": "production",
+      "authentication": {
+        "provider": "StaticWebApps"
+      },
+      "cors": {
+        "origins": [
+          "@env('CORS_ALLOWED_ORIGIN')"
+        ],
+        "allow-credentials": false
+      }
+    },
+    "graphql": {
+      "allow-introspection": false
+    },
+    "telemetry": {
+      "log-level": {
+        "default": "Warning",
+        "Azure.DataApiBuilder.Core.Resolvers.IQueryExecutor": "Warning",
+        "Azure.DataApiBuilder.Core.Resolvers.SqlQueryEngine": "Warning",
+        "Microsoft.AspNetCore": "Warning"
+      }
+    }
+  }
+}
