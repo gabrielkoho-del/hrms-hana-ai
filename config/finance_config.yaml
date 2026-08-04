@@ -1,0 +1,52 @@
+# Finance configuration for SAP HANA FI/CO table discovery and intent detection.
+# Finance keywords are loaded from this file at startup.
+# Finance tables are discovered dynamically from HANA schema unless overridden below.
+
+# Finance-related keyword phrases used for fast-path intent detection.
+# Matching is substring-based on the lowercased query string.
+# Narrow these to avoid false positives from generic business terms like "payroll policy".
+finance_keywords:
+  - "gl account"
+  - "general ledger"
+  - "bank details"
+  - "exchange rate"
+  - "currency conversion"
+  - "salary cost"
+  - "compensation cost"
+  - "benefits cost"
+  - "overhead"
+  - "personnel cost"
+  - "labor cost"
+  - "fte cost"
+
+# Table-name patterns used to discover finance tables from HANA schema at startup.
+# Tables matching any of these prefixes/patterns are considered finance tables.
+# This allows dynamic discovery instead of hardcoding table names.
+finance_table_prefixes:
+  - "FAGL"
+  - "BKPF"
+  - "BSEG"
+  - "SKA"
+  - "CSK"
+  - "T001"
+  - "TCUR"
+
+# Explicit finance table names (used as fallback if HANA schema discovery fails).
+# These should match the table-name patterns above or be added to the prefixes.
+finance_table_names:
+  - "FAGLFLEXA"
+  - "BKPF"
+  - "BSEG"
+  - "SKA1"
+  - "SKAT"
+  - "CSKS"
+  - "CSKT"
+  - "T001"
+  - "TCURC"
+  - "TCURR"
+
+# Which HANA tool to use for schema discovery.
+schema_discovery_tool: "hana_list_tables"
+
+# Cache discovered tables for this many seconds (0 = no cache, always re-query).
+schema_cache_ttl_seconds: 3600

@@ -1,4 +1,4 @@
-﻿"""
+"""
 agent/dab_client.py
 MCP client that talks to the MCP-DAB Bridge server.
 """

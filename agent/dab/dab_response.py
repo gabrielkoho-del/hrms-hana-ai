@@ -1,4 +1,4 @@
-"""agent/utils/dab_response.py
+"""agent/dab/dab_response.py
 
 Consolidated DAB/MCP response extraction utilities.
 Handles multiple response wrapper formats from Data API Builder MCP tools.
@@ -146,28 +146,6 @@ def extract_items_with_meta(result: Any) -> Tuple[List[Dict], int, bool, Optiona
     end_cursor = result.get("endCursor")
     has_next = result.get("hasNextPage", False)
     return items, len(items), has_next, end_cursor
-
-
-def extract_items_from_tool_results(tool_results: Dict[str, Any]) -> List[Dict]:
-    """
-    Scan all tool results and return the first non-empty list of items found.
-    Used by chart generator and binning logic.
-    """
-    for tool_name, output in tool_results.items():
-        if tool_name.startswith("__"):
-            continue
-        raw = output.get("result") if isinstance(output, dict) else output
-        extracted = extract_items(raw)
-        if extracted:
-            # Skip DAB error wrappers (type+text columns only)
-            if len(extracted) == 1 and set(extracted[0].keys()) == {"type", "text"}:
-                logger.warning("Skipping error wrapper in %s: %s", tool_name, extracted[0].get("text", "")[:200])
-                continue
-            if all(set(row.keys()) == {"type", "text"} for row in extracted):
-                logger.warning("Skipping text-only result in %s (likely error)", tool_name)
-                continue
-            return extracted
-    return []
 
 
 def format_dab_items_context(tool_name: str, items: List[Dict], tool_args: Dict,

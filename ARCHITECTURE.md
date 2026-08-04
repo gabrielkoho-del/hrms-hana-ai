@@ -2,7 +2,7 @@
 
 > **Generated from live codebase analysis**  
 > **Workspace:** `C:\Users\USER\Documents\hrms-hana-ai`  
-> **Last updated:** Auto-generated from current source files
+> **Last updated:** 2026-07-29 (Manual update based on code review)
 
 ---
 
@@ -15,7 +15,7 @@ This is a **multi-tenant, permission-aware, reflexive HR AI Agent** built on Fas
 | Capability | Implementation |
 |------------|---------------|
 | **Structured HR data** | DAB / SQL Server exposed via MCP JSON-RPC over SSE |
-| **Structured Finance data** | SAP HANA via MCP HTTP (Port 3100), STDIO fallback |
+| **Structured Finance data** | SAP HANA via MCP HTTP (Port 3100) |
 | **Unstructured HR policy knowledge** | RAG (ChromaDB + Gemini embeddings) |
 | **Role-based access control** | YAML-based multi-tenant RBAC with 3 role tiers |
 | **OpenAI-compatible API** | `/v1/chat/completions` with streaming + JSON modes |
@@ -24,6 +24,8 @@ This is a **multi-tenant, permission-aware, reflexive HR AI Agent** built on Fas
 | **Production observability** | OpenTelemetry metrics with graceful null fallback |
 | **Zero-touch code resolution** | Per-tenant codesetup reverse index for LLM context |
 | **Session state management** | Follow-up action caching (DST-lite) |
+| **Dynamic finance table discovery** | SAP HANA schema scanning at startup |
+| **Config-driven finance intent detection** | YAML-configured keywords and table patterns |
 
 ### Design Philosophy
 
@@ -43,28 +45,28 @@ This is a **multi-tenant, permission-aware, reflexive HR AI Agent** built on Fas
                       │  • /charts/*                │      │  • OData    │
                       │  • /exports/*               │      └──────┬──────┘
                       └─────────────────────────────┘             │
-                               │                                   │
-                      ┌────────┴────────┐                  ┌─────┴─────┐
-                      │  Reflexive Agent │                  │ SQL Server│
-                      │  (4-Stage Loop)  │                  └───────────┘
-                      └────────┬────────┘
-                               │
-                    ┌──────────┼──────────┐
-                    │          │          │
-              ┌─────┴─────┐┌───┴────┐┌────┴──────┐
-              │  Intent   ││  RAG  ││  Schema   │
-              │Classifier ││ChromaDB││Field Index│
-              │  (Gemini) ││+Gemini││(Gemini+Num│
-              └───────────┘└───────┘│Py hybrid) │
-                                    └──────────┘
-                               │
-                      ┌────────┴────────┐
-                      │  SAP HANA MCP   │
-                      │  (Port 3100)    │
-                      │  • HTTP/STDIO   │
-                      │  • 4 finance    │
-                      │    tools        │
-                      └─────────────────┘
+                                                               │
+                                                    ┌────────┴────────┐
+                                                    │  Reflexive Agent │
+                                                    │  (4-Stage Loop)  │
+                                                    └────────┬────────┘
+                                                             │
+                                                    ┌────────┼──────────┐
+                                                    │          │          │
+                                            ┌───────┴─────┐┌───┴────┐┌────┴──────┐
+                                            │  Intent   ││  RAG  ││  Schema   │
+                                            │Classifier ││ChromaDB││Field Index│
+                                            │  (Gemini) ││+Gemini││(Gemini+Num│
+                                            └───────────┘└───────┘│Py hybrid) │
+                                                                    └──────────┘
+                                                                       │
+                                                            ┌────────┴────────┐
+                                                            │  SAP HANA MCP   │
+                                                            │  (Port 3100)    │
+                                                            │  • HTTP         │
+                                                            │  • 4 finance    │
+                                                            │    tools        │
+                                                            └─────────────────┘
 ```
 
 ---
@@ -73,14 +75,7 @@ This is a **multi-tenant, permission-aware, reflexive HR AI Agent** built on Fas
 
 ### 3.1 LLM Client (`agent/llm_client.py`)
 
-The **unified LLM client** supports multiple providers via OpenAI-compatible endpoints. **Gemini is the primary provider**; Groq is retained as an optional fallback.
-
-#### Provider Configuration
-
-| Provider | Endpoint | Primary Use |
-|----------|----------|-------------|
-| **Gemini** (primary) | `https://generativelanguage.googleapis.com/v1beta/openai` | All LLM calls — intent, planning, summarization |
-| Groq (fallback) | `https://api.groq.com/openai/v1/chat/completions` | Optional fallback if Gemini unavailable |
+The **LLM client** uses Google Gemini 3.1 Flash Lite via OpenAI-compatible endpoint.
 
 #### Model Tiers
 
@@ -94,14 +89,13 @@ MODEL_TIERS = {
 
 #### Key Features
 
-- **Unified OpenAI-compatible format**: All providers use the same request/response shape — no conversion layer
+- **Unified OpenAI-compatible format**: Uses Gemini 3.1 Flash Lite API
 - **Tier-aware model selection**: Different temperature/token settings per pipeline stage
 - **Token budget tracking**: Daily RPD tracking (500/day free tier) with actual usage from API response headers
 - **Automatic fallback chain**:
   1. Model-not-found → fallback to `gemini-3.5-flash`
   2. Rate limit (429) → retry with `retry-after` sleep
   3. JSON mode error → retry without `response_format`
-- **Backward compatibility**: `call_groq = call_llm` alias preserves existing imports
 
 #### Budget & Rate Limits (Gemini Free Tier)
 
@@ -115,7 +109,7 @@ MODEL_TIERS = {
 
 ### 3.2 DAB Client (`agent/dab_client.py`) / HANA Client (`agent/hana_client.py`)
 
-The system has two structured-data sources, both exposed as MCP-style tools to the agent:
+The system has two structured-data sources, both exposed as MCP-style tools to the agent.
 
 #### DAB Client
 
@@ -133,7 +127,7 @@ The **MCP-DAB Bridge client** connects to the DAB server via JSON-RPC over SSE t
 
 Per-tenant client routing via `tenant_mappings.yaml`:
 
-Tenant ID → DAB URL → Client instance → Entity cache (5-min TTL)
+| Tenant ID → DAB URL → Client instance → Entity cache (5-min TTL) |
 
 | Method | Purpose |
 |--------|---------|
@@ -151,21 +145,47 @@ Tenant ID → DAB URL → Client instance → Entity cache (5-min TTL)
 | `aggregate_records` | Grouped aggregations | `entity`, `function`, `field`, `groupby`, `having`, `filter`, `first` |
 | `describe_entities` | Schema discovery | _(none)_ |
 
----
-
 #### HANA Client
 
-The **SAP HANA MCP client** connects to the `hana-mcp-server` (Node.js) via HTTP-first transport with STDIO fallback.
+The **SAP HANA MCP client** connects to the `hana-mcp-server` (Node.js) via HTTP transport.
 
 ##### Key Features
 
-- **HTTP-first transport**: Primary path is `POST {HANAMCP_HTTP_URL}/mcp` (JSON-RPC over HTTP), avoiding STDIO process-management anti-patterns inside FastAPI.
-- **STDIO fallback**: Falls back to `node hana-mcp-server.js` subprocess only when HTTP is unreachable.
-- **Result normalization**: Converts HANA `{"columns": [...], "rows": [...]}` into agent-standard `{"result": [dicts], "message": "..."}` via `normalize_hana_result()`.
-- **HanaTenantClientManager**: Registry keyed by `db_name`, `schema_name`, and `tenant_id`, with lazy init and `close_all()` shutdown.
-- **Schema-agnostic downstream**: The executor writes HANA results into `state["tool_results"]` in the same shape as DAB, so summarizer/chart/export logic remains unchanged.
+- **HTTP transport**: Path is `POST {HANAMCP_HTTP_URL}/mcp` (JSON-RPC over HTTP), avoiding STDIO process-management anti-patterns inside FastAPI
+- **Result normalization**: Converts HANA `{"columns": [...], "rows": [...]}` into agent-standard `{"result": [dicts], "message": "..."}` via `normalize_hana_result()`
+- **HanaTenantClientManager**: Registry keyed by `db_name`, `schema_name`, and `tenant_id`, with lazy init and `close_all()` shutdown
+- **Schema-agnostic downstream**: The executor writes HANA results into `state["tool_results"]` in the same shape as DAB, so summarizer/chart/export logic remains unchanged
 
-##### Exposed HANA Tools (4 tools)
+##### Finance Table Discovery (NEW)
+
+Finance tables are discovered dynamically from HANA schema at startup, not hardcoded:
+
+1. `agentic_executor.py` calls `initialize_finance_tables(hana_client)` once per process lifetime
+2. `intent_classifier.py` queries `hana_list_tables` and filters results by configurable prefixes (`FAGL`, `BKPF`, `BSEG`, `SKA`, `CSK`, `T001`, `TCUR`)
+3. Discovered tables are cached in-memory with a TTL (default 1 hour, configurable via `schema_cache_ttl_seconds`)
+4. If HANA is unavailable at startup, falls back to hardcoded table names from `config/finance_config.yaml`
+
+This replaces the previous hardcoded `_HANA_FINANCE_TABLES` set with a dynamic, config-driven approach.
+
+| Aspect | Detail |
+|--------|--------|
+| Discovery trigger | Once at startup, per process |
+| Cache key | None needed — single global set per process |
+| Cache TTL | 3600s (configurable) |
+| Fallback | `config/finance_config.yaml` → `finance_table_names` |
+| Config location | `config/finance_config.yaml` |
+
+##### Finance Keyword Configuration (NEW)
+
+Finance intent keywords are loaded from `config/finance_config.yaml` at import time, not hardcoded in source:
+
+| Config Key | Purpose | Default |
+|------------|---------|---------|
+| `finance_keywords` | Substring-matched terms for fast-path intent detection | Narrowed list (see config file) |
+| `finance_table_prefixes` | HANA table name prefixes for dynamic discovery | `FAGL`, `BKPF`, `BSEG`, `SKA`, `CSK`, `T001`, `TCUR` |
+| `finance_table_names` | Fallback tables if schema discovery fails | `FAGLFLEXA`, `BKPF`, `BSEG`, `SKA1`, `SKAT`, `CSKS`, `CSKT`, `T001`, `TCURC`, `TCURR` |
+| `schema_discovery_tool` | HANA tool used for discovery | `hana_list_tables` |
+| `schema_cache_ttl_seconds` | How long to cache discovered tables | 3600 |
 
 | Tool | Purpose | Parameters |
 |------|---------|------------|
@@ -205,7 +225,7 @@ Single Gemini call (~200 tokens) returns structured `IntentResult`:
 @dataclass
 class IntentResult:
     intent: str                      # e.g., "leave_request", "salary_analysis"
-    intent_category: str             # personal_data | aggregate_data | policy_info | action_request | emergency | grievance
+    intent_category: str             # personal_data | aggregate_data | policy_info | action_request | emergency | grievance | greeting | finance_gl_analysis | finance_cost_analysis | finance_currency | finance_budget
     data_scope: str                  # individual | aggregate | none
     chart_eligible: bool             # True only for aggregate_data
     urgency_level: str               # routine | time_sensitive | urgent | distressed
@@ -216,6 +236,7 @@ class IntentResult:
     action_oriented: bool
     wants_export: bool               # True if user explicitly asks to export/download
     is_ambiguous: bool               # True if "yes"/"ok" to multi-option offer
+    finance_query: bool = False      # True if query involves SAP FI/CO finance data
 ```
 
 **New capabilities**:
@@ -368,7 +389,7 @@ fields = await search_relevant_fields(user_query, cached_schema, tenant_id, top_
 #### Usage
 
 ```python
-from agent.code_resolver import scan_for_codes
+from agent.dab.code_resolver import scan_for_codes
 code_context_md = await scan_for_codes(tool_results, tenant_id)
 # Injected into summarizer prompt before chart generation
 ```
@@ -442,14 +463,6 @@ tenants:
     group_mappings:
       "TestHR": HRMS_HR
       "TestEmployee": HRMS_EMPLOYEE
-
-roles:
-  HRMS_HR:
-    permissions: [read:all_employees, write:all_employees, read:salary, read:org_hierarchy, run_safe_query, admin:manage_mappings]
-  HRMS_MANAGER:
-    permissions: [read:subordinates, write:subordinates, read:subordinate_salary, read:org_hierarchy, run_safe_query]
-  HRMS_EMPLOYEE:
-    permissions: [read:self, read:org_hierarchy, run_safe_query]
 ```
 
 Resolution chain: **External Groups → Internal Roles → Permissions**
@@ -550,56 +563,56 @@ Two-layer defense:
 │  6. If direct_answer: return it         │
 │                                         │
 │  7. For each step in plan:               │
-│     DAB path:                           │
-│     a. normalize_odata_args()           │
-│        → entity/field case normalization │
-│     b. enforce_tool_args(tool, args)    │
-│        → blocked? store error, skip      │
-│     c. validate_dab_args()              │
-│        → JSON Schema pre-validation      │
-│     d. invoke_dab_tool_with_retry()     │
-│        → SSE call to DAB bridge          │
-│     e. extract_payload()                 │
-│        → unwrap MCP content wrapper      │
-│     f. filter_tool_results()            │
-│        → post-execution row filtering    │
-│     g. parse JSON result                │
-│                                         │
-│     HANA path:                          │
-│     a. _execute_hana_tool_call()        │
-│        → HTTP or STDIO dispatch          │
-│     b. normalize_hana_result()          │
-│        → columns/rows → result: [dicts] │
-│     c. filter_tool_results()            │
-│        → post-execution row filtering    │
-│                                         │
-│     h. extract chartable data           │
-│        → generate_chart() if applicable  │
-│                                         │
-│  8. CLIENT-SIDE BINNING (if planned):   │
-│     → apply_client_side_binning()        │
-│                                         │
-│  9. CODE RESOLUTION (if codes found):   │
-│     → scan_for_codes() → LLM context     │
-│                                         │
-│  10. EXCEL EXPORT (if requested):       │
-│     → export_to_excel_with_chart()       │
-│                                         │
-│  11. If plan.rag: retrieve_policy_context()│
-│     → ChromaDB query with Gemini embed   │
-│                                         │
-│  12. summarize_results()                 │
-│     → build_response_structure()         │
-│     → build_tone_block(tone_context)      │
-│     → build_data_protocol()              │
-│     → detect_conflicts(rag vs sql)       │
-│     → build_zero_row_guidance()          │
-│     → build_formatting_protocol()        │
-│     → chart artifact injection           │
-│     [LLM call #3 — Gemini]              │
-│                                         │
-│  13. Save session state for follow-up   │
-│  14. Return final text                  │
+  │     DAB path:                           │
+  │     a. normalize_odata_args()           │
+  │        → entity/field case normalization │
+  │     b. enforce_tool_args(tool, args)    │
+  │        → blocked? store error, skip      │
+  │     c. validate_dab_args()              │
+  │        → JSON Schema pre-validation      │
+  │     d. invoke_dab_tool_with_retry()     │
+  │        → SSE call to DAB bridge          │
+  │     e. extract_payload()                 │
+  │        → unwrap MCP content wrapper      │
+  │     f. filter_tool_results()            │
+  │        → post-execution row filtering    │
+  │     g. parse JSON result                │
+  │                                         │
+  │     HANA path:                          │
+  │     a. _execute_hana_tool_call()        │
+  │        → HTTP dispatch                  │
+  │     b. normalize_hana_result()          │
+  │        → columns/rows → result: [dicts] │
+  │     c. filter_tool_results()            │
+  │        → post-execution row filtering    │
+  │                                         │
+  │     h. extract chartable data           │
+  │        → generate_chart() if applicable  │
+  │                                         │
+  │  8. CLIENT-SIDE BINNING (if planned):   │
+  │     → apply_client_side_binning()        │
+  │                                         │
+  │  9. CODE RESOLUTION (if codes found):   │
+  │     → scan_for_codes() → LLM context     │
+  │                                         │
+  │  10. EXCEL EXPORT (if requested):       │
+  │     → export_to_excel_with_chart()       │
+  │                                         │
+  │  11. If plan.rag: retrieve_policy_context()│
+  │     → ChromaDB query with Gemini embed   │
+  │                                         │
+  │  12. summarize_results()                 │
+  │     → build_response_structure()         │
+  │     → build_tone_block(tone_context)      │
+  │     → build_data_protocol()              │
+  │     → detect_conflicts(rag vs sql)       │
+  │     → build_zero_row_guidance()          │
+  │     → build_formatting_protocol()        │
+  │     → chart artifact injection           │
+  │     [LLM call #3 — Gemini]              │
+  │                                         │
+  │  13. Save session state for follow-up   │
+  │  14. Return final text                  │
 └───┬─────────────────────────────────────┘
     │
     ▼
@@ -645,7 +658,7 @@ Two-layer defense:
 | Pre-execution | Tool-level permission blocks | `main.py:enforce_tool_args()` |
 | DAB filter validation | OData self-filter validation | `tool_planner.py:validate_dab_filter_permissions()` |
 | Post-execution | Result row filtering by email/emp_id | `main.py:filter_tool_results()` |
-| HANA transport | HTTP-first, STDIO fallback | `hana_client.py:_HttpMpcClient` |
+| HANA transport | HTTP transport | `hana_client.py:_HttpMpcClient` |
 | HANA normalization | Adapter encapsulation | `hana_client.py:normalize_hana_result()` |
 | DAB bridge | Read-only entity definitions | `dab-config.json` |
 
@@ -710,7 +723,7 @@ This prevents the AI from hallucinating leave balances based on policy text. If 
 | Gemini 429 rate limit | Retry with `retry-after` sleep |
 | Gemini JSON mode error | Retry without `response_format` |
 | DAB server down | `discover_tools()` catches exception, sets empty cache |
-| HANA server down | HTTP failure falls back to STDIO; total failure returns empty result with warning |
+| HANA server down | Returns empty result with warning |
 | RAG unavailable | `retrieve_policy_context()` returns `""`, summarizer proceeds without it |
 | Intent classification fails | Returns neutral default (`general_hr`, routine, neutral) |
 | Tool plan parsing fails | Returns empty steps → agent asks for clarification |
@@ -737,6 +750,7 @@ This prevents the AI from hallucinating leave balances based on policy text. If 
 | `SchemaFieldIndex` | Per-tenant | Startup (`warm_schema_index`) | 1 hr (disk) |
 | `CodeResolver` | Per-tenant | On first use | 5 min |
 | `Session state` | Per-user | Every turn | In-memory only |
+| **Finance tables** | **Global** | **Startup (`initialize_finance_tables`)** | **1 hr (configurable)** |
 
 ---
 
@@ -803,15 +817,9 @@ Used for auto-discovery and schema caching.
 | Env Var | Default | Purpose |
 |---------|---------|---------|
 | `GEMINI_API_KEY` | — | **Primary LLM API key** |
-| `GROQ_API_KEY` | — | Optional fallback LLM API key |
-| `LLM_PROVIDER` | `gemini` | `gemini` or `groq` |
-| `GEMINI_URL` | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini OpenAI-compatible endpoint |
-| `GROQ_URL` | `https://api.groq.com/openai/v1/chat/completions` | Groq endpoint |
-| `GEMINI_API_KEY` (RAG) | — | RAG embeddings (same key, free tier) |
 | `DB_CONN_STR` | ODBC to HRMSlocal | Legacy; DAB handles DB now |
 | `MCP_SERVER_URL` | `http://localhost:5000` | DAB fallback URL |
 | `HANAMCP_HTTP_URL` | `http://localhost:3100` | SAP HANA MCP HTTP endpoint |
-| `HANAMCP_STDIO_CMD` | `node hana-mcp-server.js` | HANA STDIO fallback command |
 | `CHROMA_DB_PATH` | `./chroma_db` | Vector store location |
 | `CHROMA_COLLECTION_NAME` | `hr_policies` | Chroma collection |
 | `SCHEMA_CACHE_DIR` | `data/schema_cache` | Schema index disk cache |
@@ -823,12 +831,13 @@ Used for auto-discovery and schema caching.
 | `DEFAULT_MAX_ROWS` | `100` | Default query limit |
 | `LARGE_RESULT_THRESHOLD` | `20` | Auto-export trigger |
 | `RATE_LIMIT_PER_MINUTE` | `30` | API rate limit |
-| `EXPORT_DIR` | `./agent/exports` | Excel output directory |
+| `EXPORT_DIR` | `./agent/output/exports` | Excel output directory |
 | `CHART_OUTPUT_DIR` | `./agent/output` | Chart PNG output directory |
 | `CHART_MODE` | `auto` | `matplotlib` / `mermaid` / `auto` / `base64` |
 | `CHART_MAX_CATEGORIES` | `20` | Max categories in chart |
 | `OTEL_SERVICE_NAME` | `hr-ai-agent` | OpenTelemetry service name |
 | `DAB_DISCOVERY_TENANT` | `RDEMOROCKFORT` | Default tenant for tool discovery |
+| `FINANCE_TABLE_CACHE_TTL` | `3600` | Finance table discovery cache TTL (seconds) |
 
 ---
 
@@ -840,9 +849,8 @@ Used for auto-discovery and schema caching.
 | Chat UI | LibreChat |
 | MCP Protocol | `mcp` Python SDK (FastMCP + ClientSession) |
 | DAB Transport | JSON-RPC 2.0 over SSE |
-| HANA Transport | HTTP JSON-RPC (port 3100), STDIO fallback |
+| HANA Transport | HTTP JSON-RPC (port 3100) |
 | **LLM (Primary)** | **Google Gemini 3.1 Flash Lite (OpenAI-compatible endpoint)** |
-| LLM (Fallback) | Groq API (optional) |
 | Embeddings | Google Gemini Embedding-2 (free tier) |
 | Vector DB | ChromaDB (persistent) |
 | Semantic Search | NumPy + cosine similarity + keyword hybrid |
@@ -867,115 +875,149 @@ hrms-hana-ai/
 │
 ├── agent/
 │   ├── main.py               # FastAPI app, orchestration, auth, rate limits, tool discovery
-│   ├── agentic_executor.py   # Reflexive 4-stage pipeline (L1 Guard → Intent → Plan → Execute → Summarize)
-│   │                           # Registry-driven execution for DAB + HANA
-│   ├── intent_classifier.py  # LLM-based intent + tone classification with deterministic category mapping
-│   │                           # NEW: follow-up affirmative detection, ambiguous response handling, wants_export
-│   ├── tool_planner.py       # Permission-aware dual-path planner (native tool calling + JSON fallback)
-│   │                           # NEW: semantic schema retrieval, explicit chart type detection, export intent inference
-│   │                           # NEW: HANA tool schemas merged under token budget
-│   ├── hana_client.py        # SAP HANA MCP client (HTTP-first + STDIO fallback)
-│   │                           # NEW: HanaTenantClientManager registry, result normalizer
-│   ├── summarizer/            # 3-stage response structure (Inform → Assist → Offer feedback), tone engine, conflict detection
-│   │                           # NEW: ambiguous response override, export-aware guidance, offer formatting rules
-│   ├── llm_client.py         # Unified LLM client (Gemini primary, Groq fallback) — REPLACES groq_client.py
-│   ├── rag_retriever.py      # ChromaDB + Gemini embedding retriever with conservative rate limiting
-│   ├── schema_index.py       # In-memory semantic field index (Gemini + NumPy hybrid search)
-│   ├── chart_generator.py    # matplotlib + Mermaid chart generation with privacy enforcement
-│   ├── excel_exporter.py     # pandas Excel export with chart-rich 5-worksheet reports
 │   ├── code_resolver.py      # Zero-touch code resolution for multi-tenant DAB (codesetup reverse index)
-│   ├── dab_client.py         # MCP-DAB bridge client with SSE parsing and tenant routing
 │   ├── config.py             # Centralized env/config constants
 │   │
-│   ├── auth/
-│   │   ├── dependencies.py   # FastAPI verify_token dependency
-│   │   ├── models.py         # JWT validation + AuthContext dataclass
-│   │   ├── tenant_resolver.py # YAML group → role → permission mapping + DAB URL resolution
+│   ├── core/                 # Core agent pipeline
+│   │   ├── agentic_executor.py   # Reflexive 4-stage pipeline
+│   │   ├── intent_classifier.py  # LLM-based intent + tone classification
+│   │   ├── tool_planner.py       # Permission-aware dual-path planner
+│   │   ├── prompts.py            # System prompt builders
+│   │   ├── session_state.py      # Lightweight session state for follow-up actions
+│   │   ├── guards.py             # L1/L2 intent guards
+│   │   └── __init__.py
+│   │
+│   ├── integrations/         # External service integrations
+│   │   ├── dab_client.py         # MCP-DAB bridge client with SSE parsing
+│   │   ├── hana_client.py        # SAP HANA MCP client
+│   │   ├── llm_client.py         # Unified LLM client (Gemini primary)
+│   │   ├── rag_retriever.py      # ChromaDB + Gemini retriever
+│   │   ├── schema_index.py       # In-memory semantic field index
+│   │   ├── schema_registry.py    # HANA schema registry
+│   │   └── __init__.py
+│   │
+│   ├── output/               # Visualization & export
+│   │   ├── chart_generator.py    # matplotlib + Mermaid charts
+│   │   ├── excel_exporter.py     # pandas Excel export
+│   │   ├── export_service.py     # Export metadata + chart integration
+│   │   ├── binning.py            # Binning configuration and metadata inference
+│   │   ├── binning_orchestrator.py # Client-side binning orchestration
+│   │   ├── exports/              # Generated Excel files (served via /exports/*)
 │   │   └── __init__.py
 │   │
 │   ├── dab/                  # DRY-consolidated DAB/MCP cross-cutting utilities
-│   │   ├── dab_response.py   # DAB/MCP response extraction (consolidated from 3+ duplications)
+│   │   ├── dab_response.py   # DAB/MCP response extraction
 │   │   ├── metrics.py        # OpenTelemetry metrics with lazy init + null fallback
 │   │   ├── validation.py     # JSON Schema pre-validation for DAB tool arguments
-│   │   ├── odata_normalizer.py # OData argument normalization (entity/field names, numeric types)
+│   │   ├── odata_normalizer.py # OData argument normalization
 │   │   └── __init__.py
 │   │
-│   ├── exports/              # Generated Excel files (served via /exports/*)
-│   └── output/               # Generated chart PNGs (served via /charts/*)
-│
-├── ingestion/
-│   ├── ingestion.py          # Per-file PDF ingestion script (PyMuPDF)
-│   ├── index.py              # LlamaIndex + ChromaDB builder with contextual chunking
-│   └── gemini_embedder.py   # LlamaIndex-compatible Gemini embedder with rate limiting
-│
-├── config/
-│   ├── .env                  # Environment variables (secrets)
-│   ├── dab-config.json       # DAB entity definitions
-│   └── tenant_mappings.yaml  # Multi-tenant RBAC + DAB URL routing
-│
-├── data/
-│   ├── raw_docs/             # Source PDFs (e.g., Employee Handbook)
-│   ├── chroma_db/            # Persistent ChromaDB vector store
-│   └── schema_cache/         # Schema index disk cache (.npz files)
-│
-├── sql/                      # SQL scripts and schema definitions
-│
-├── tools/
-│   └── generate_test_jwt.py # JWT generator for local testing
-│
-│
-├── venv311/                  # Python virtual environment
-│
-├── hana-mcp-server/          # SAP HANA MCP server (Node.js)
-│   ├── src/
-│   │   ├── server/           # MCP server implementation
-│   │   └── constants/        # Tool definitions, permissions
-│   ├── hana-mcp-server.js   # Entry point
-│   └── package.json
-│
-├── requirements.txt          # Python dependencies
-└── package.json              # Node.js dependencies (for hana-mcp-server)
-
----
-
-## 10. Current State Assessment
-
-### What's Working Well
-
-- ✅ Multi-tenant RBAC with permission-aware tool filtering
-- ✅ OpenAI-compatible API with streaming support
-- ✅ **Gemini 3.1 Flash Lite as primary LLM** (1M context, 64K output) with Groq as optional fallback
-- ✅ DAB-based data abstraction for HR data (replaces custom MCP server)
-- ✅ **SAP HANA integration** via HTTP-first MCP client with result normalization (`hana_client.py`)
-- ✅ Registry-driven executor (`_TOOL_REGISTRY`) — idiomatic replacement for prefix string-matching
-- ✅ Unified execution contract — DAB and HANA results share `state["tool_results"]` shape
-- ✅ RAG with free Gemini embeddings and conservative rate limiting
-- ✅ Tone-aware responses (empathy for distressed users)
-- ✅ Source-of-truth discipline (DB over policy text for personal data)
-- ✅ Excel export + chart generation for large results
-- ✅ DAB OData filter validation (read-only by design)
-- ✅ Caching of tools, schema, distinct values, and schema index at startup
-- ✅ DRY consolidation: `agent/dab/` centralizes response extraction, metrics, validation, normalization
-- ✅ Semantic schema index for field discovery without external vector DB
-- ✅ OpenTelemetry metrics with graceful null fallback
-- ✅ 3-stage response structure (Inform → Assist → Offer feedback)
-- ✅ Client-side dynamic binning for multi-tenant schemas
-- ✅ Chart artifact injection into LLM context (industry standard)
-- ✅ **Session state management** for follow-up actions (export, drill-down)
-- ✅ **Code resolver** for zero-touch multi-tenant code translation
-- ✅ **Ambiguous response handling** prevents guessing on "yes"/"ok"
-- ✅ **Export-aware guidance** suppresses redundant data when Excel is primary deliverable
-
-### Areas for Improvement
-
-- ⚠️ No retry logic for DAB server startup (if DB is down at startup, `discover_tools` fails silently)
-- ⚠️ `GeminiRateLimiter` and `GeminiGenAIEmbedder` have duplicated rate limiting logic — could be unified into `agent/dab/`
-- ⚠️ `tenant_mappings.yaml` `default_role: null` means no access for unmapped groups — consider a read-only fallback
-- ⚠️ `CHART_OUTPUT_DIR` default `/mnt/agents/output` was changed to `./agent/output` — verify in all environments
-- ⚠️ Session state is in-memory only — not persisted across restarts
-- ⚠️ Code resolver uses cursor-based pagination but `page_size` variable is referenced before assignment in `_extract_items`
-- ⚠️ Schema token budget (`TOKEN_BUDGET = 1500`) is conservative for Gemini 3.1 Flash Lite's 1M context; consider raising to 4,000–6,000 tokens to reduce over-pruning
-
----
-
-*End of Architecture Document*
+│   ├── auth/                 # Authentication and tenant resolution
+│   │   ├── dependencies.py   # FastAPI verify_token dependency
+│   │   ├── models.py         # JWT validation + AuthContext dataclass
+│   │   ├── tenant_resolver.py # YAML group → role → permission mapping
+│   │   ├── role_resolver.py  # Auth role resolution + row-level self-access check
+│   │   └── __init__.py
+│   │
+│   ├── summarizer/           # 3-stage response structure
+│   │   ├── response_summarizer.py
+│   │   ├── aggregation.py
+│   │   ├── tool_results.py
+│   │   ├── prompt/           # Prompt construction modules
+│   │   │   ├── tone.py
+│   │   │   ├── structure.py
+│   │   │   ├── registry.py
+│   │   │   ├── formatting.py
+│   │   │   ├── export_guidance.py
+│   │   │   └── data_rules.py
+│   │   ├── validators/       # Response validators
+│   │   │   └── conflict.py
+│   │   └── __init__.py
+│   │
+│   └── __init__.py
+│   ├── ingestion/
+│   │   ├── ingestion.py          # Per-file PDF ingestion script (PyMuPDF)
+│   │   ├── index.py              # LlamaIndex + ChromaDB builder with contextual chunking
+│   │   └── gemini_embedder.py   # LlamaIndex-compatible Gemini embedder with rate limiting
+│   │
+│   ├── config/
+│   │   ├── .env                  # Environment variables (secrets)
+│   │   ├── dab-config.json       # DAB entity definitions
+│   │   ├── dab-config.Production.json
+│   │   ├── dab-config.Rymnet.json
+│   │   ├── dab-config.Rymnet.test.json
+│   │   ├── finance_config.yaml   # (NEW) 
+│   │                                │   discovery + intent keyword configuration
+│   │   ├── suggestions.yaml
+│   │   └── tenant_mappings.yaml  # Multi-tenant RBAC + DAB URL routing
+│   │
+│   ├── data/
+│   │   ├── raw_docs/             # Source PDFs (e.g., Employee Handbook)
+│   │   ├── chroma_db/            # Persistent ChromaDB vector store
+│   │   └── schema_cache/         # Schema index disk cache (.npz files)
+│   │
+│   ├── sql/                      # SQL scripts and schema definitions
+│   │
+│   ├── tools/
+│   │   └── generate_test_jwt.py # JWT generator for local testing
+│   │
+│   ├── venv311/                  # Python virtual environment
+│   │
+│   ├── hana-mcp-server/          # SAP HANA MCP server (Node.js)
+│   │   ├── src/
+│   │   │   ├── server/           # MCP server implementation
+│   │   │   └── constants/        # Tool definitions, permissions
+│   │   ├── hana-mcp-server.js   # Entry point
+│   │   └── package.json
+│   │
+│   ├── requirements.txt          # Python dependencies
+│   └── package.json              # Node.js dependencies (for hana-mcp-server)
+│   
+│   ---
+│   
+│   ## 10. Current State Assessment
+│   
+│   ### What's Working Well
+│   
+│   - ✅ Multi-tenant RBAC with permission-aware tool filtering
+│   - ✅ OpenAI-compatible API with streaming support
+│   - ✅ **Gemini 3.1 Flash Lite as primary LLM** (1M context, 64K output)
+│   - ✅ DAB-based data abstraction for HR data (replaces custom MCP server)
+│   - ✅ **Config-driven finance keywords** — loaded from `config/finance_config.yaml`, not hardcoded in source
+│   - ✅ **SAP HANA integration** via HTTP-first MCP client with result normalization (`hana_client.py`)
+│   - ✅ Registry-driven executor (`_TOOL_REGISTRY`) — idiomatic replacement for prefix string-matching
+│   - ✅ Unified execution contract — DAB and HANA results share `state["tool_results"]` shape
+│   - ✅ RAG with free Gemini embeddings and conservative rate limiting
+│   - ✅ Tone-aware responses (empathy for distressed users)
+│   - ✅ Source-of-truth discipline (DB over policy text for personal data)
+│   - ✅ Excel export + chart generation for large results
+│   - ✅ DAB OData filter validation (read-only by design)
+│   - ✅ Caching of tools, schema, distinct values, and schema index at startup
+│   - ✅ DRY consolidation: `agent/dab/` centralizes response extraction, metrics, validation, normalization
+│   - ✅ Semantic schema index for field discovery without external vector DB
+│   - ✅ OpenTelemetry metrics with graceful null fallback
+│   - ✅ 3-stage response structure (Inform → Assist → Offer feedback)
+│   - ✅ Client-side dynamic binning for multi-tenant schemas
+│   - ✅ Chart artifact injection into LLM context (industry standard)
+│   - ✅ **Session state management** for follow-up actions (export, drill-down)
+│   - ✅ **Code resolver** for zero-touch multi-tenant code translation
+│   - ✅ **Ambiguous response handling** prevents guessing on "yes"/"ok"
+│   - ✅ **Finance intent detection** — config-driven keywords + dynamic HANA schema discovery at startup
+│   - ✅ **Finance table discovery** — queries `hana_list_tables` at startup, caches with TTL, falls back to YAML config
+│   - ✅ **Finance keyword narrowing** — removed broad terms (`company code`, `fiscal year`, `payroll`, `depreciation`) that caused false positives
+│   - ✅ **Monolithic refactoring** — extracted `agent/prompts.py`, `agent/binning.py`, `agent/session_state.py` from `tool_planner.py` and `agentic_executor.py`
+│   - ✅ **Finance intent consolidation** — removed duplicate `_HANA_FINANCE_TABLES` and `_FINANCE_KEYWORDS` from executor, consolidated into intent_classifier.py
+│   
+│   ### Areas for Improvement
+│   
+│   - ⚠️ No retry logic for DAB server startup (if DB is down at startup, `discover_tools` fails silently)
+│   - ⚠️ `GeminiRateLimiter` and `GeminiGenAIEmbedder` have duplicated rate limiting logic — could be unified into `agent/dab/`
+│   - ⚠️ `tenant_mappings.yaml` `default_role: null` means no access for unmapped groups — consider a read-only fallback
+│   - ⚠️ `CHART_OUTPUT_DIR` default `/mnt/agents/output` was changed to `./agent/output` — verify in all environments
+│   - ⚠️ Session state is in-memory only — not persisted across restarts
+│   - ⚠️ Code resolver uses cursor-based pagination but `page_size` variable is referenced before assignment in `_extract_items`
+│   - ⚠️ Schema token budget (`TOKEN_BUDGET = 1500`) is conservative for Gemini 3.1 Flash Lite's 1M context; consider raising to 4,000–6,000 tokens to reduce over-pruning
+│   
+│   ---
+│   
+│   *End of Architecture Document*

@@ -3,36 +3,6 @@
 import os
 
 # ==============================
-# DAB MCP SERVER (replaces custom MCP server)
-# ==============================
-# DEPRECATED: DAB routing is now per-tenant via tenant_mappings.yaml.
-# Keep MCP_SERVER_URL env var only as an emergency fallback.
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:5000")
-
-# ==============================
-# RAG / CHROMADB
-# ==============================
-CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
-CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "hr_policies")
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
-
-# ==============================
-# DAB MCP SERVER (replaces custom MCP server)
-# ==============================
-# DEPRECATED: DAB routing is now per-tenant via tenant_mappings.yaml.
-# Keep MCP_SERVER_URL env var only as an emergency fallback.
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:5000")
-
-# ==============================
-# RAG / CHROMADB
-# ==============================
-CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
-CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "hr_policies")
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
-
-# ==============================
 # QUERY / EXPORT LIMITS
 # ==============================
 DEFAULT_MAX_ROWS = int(os.getenv("DEFAULT_MAX_ROWS", "100"))
@@ -59,3 +29,10 @@ JWT_ISSUER_ALLOWLIST = os.getenv("JWT_ISSUER_ALLOWLIST", "")
 JWT_ISSUERS = [i.strip() for i in JWT_ISSUER_ALLOWLIST.split(",") if i.strip()] or ["local-dev-issuer"]
 DEV_TEST_TOKEN = os.getenv("DEV_TEST_TOKEN", "")
 AUTH_MODE = os.getenv("AUTH_MODE", "test")  # "test", "production", "disabled"
+
+# ==============================
+# PLANNER / LLM
+# ==============================
+PLANNER_TIER = os.getenv("PLANNER_TIER", "gemini-2.5-flash")
+PLANNER_ESTIMATED_TOKENS = int(os.getenv("PLANNER_ESTIMATED_TOKENS", "5500"))
+CONVERSATION_HISTORY_TOKEN_BUDGET = int(os.getenv("CONVERSATION_HISTORY_TOKEN_BUDGET", "2000"))

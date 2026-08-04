@@ -1,4 +1,4 @@
-"""agent/utils/metrics.py
+"""agent/dab/metrics.py
 
 OpenTelemetry metrics setup for the HR AI Agent.
 Provides structured counters for DAB operations, chart generation, and error tracking.

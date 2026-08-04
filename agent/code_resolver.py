@@ -1,5 +1,5 @@
 """
-agent/code_resolver.py
+agent/dab/code_resolver.py
 Zero-touch code resolution for multi-tenant DAB production.
 Fetches codesetup from each tenant's DAB and builds reverse index for LLM context injection.
 """
@@ -127,7 +127,7 @@ class CodeResolver:
 
     async def _refresh_cache(self):
         """Fetch codesetup via DAB cursor pagination and build reverse index."""
-        from agent.dab_client import dab_manager
+        from agent.integrations.dab_client import dab_manager
         import asyncio
 
         try:

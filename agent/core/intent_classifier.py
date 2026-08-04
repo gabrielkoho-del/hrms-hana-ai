@@ -8,20 +8,72 @@ offered multiple options. Forces clarification instead of guessing.
 """
 import json
 import logging
+import os
 import re
-from typing import Dict, Any
+import time
+from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass
 
-from agent.llm_client import call_llm
+import yaml
+
+from agent.integrations.llm_client import call_llm
 
 from functools import lru_cache
 logger = logging.getLogger("hr_agent")
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# FINANCE CONFIG — loaded from YAML at startup
+# ═══════════════════════════════════════════════════════════════════════
+
+_FINANCE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "finance_config.yaml")
+
+def _load_finance_config() -> Dict:
+    """Load finance configuration from YAML file."""
+    if not os.path.isfile(_FINANCE_CONFIG_PATH):
+        logger.warning("Finance config not found at %s, using defaults", _FINANCE_CONFIG_PATH)
+        return {}
+    try:
+        with open(_FINANCE_CONFIG_PATH, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        return config if isinstance(config, dict) else {}
+    except Exception as e:
+        logger.warning("Failed to load finance config from %s: %s", _FINANCE_CONFIG_PATH, e)
+        return {}
+
+
+_FINANCE_CONFIG = _load_finance_config()
+
+# Finance keywords loaded from config (narrowed to avoid false positives)
+_FINANCE_KEYWORDS: Set[str] = set(_FINANCE_CONFIG.get("finance_keywords", [
+    "gl account", "general ledger", "bank details",
+    "exchange rate", "currency conversion",
+    "salary cost", "compensation cost", "benefits cost",
+    "overhead", "personnel cost", "labor cost", "fte cost",
+]))
+
+# Table-name prefixes used to discover finance tables from HANA schema
+_FINANCE_TABLE_PREFIXES: List[str] = _FINANCE_CONFIG.get("finance_table_prefixes", [
+    "FAGL", "BKPF", "BSEG", "SKA", "CSK", "T001", "TCUR",
+])
+
+# Explicit finance table names (fallback if HANA schema discovery fails)
+_FINANCE_FALLBACK_TABLES: Set[str] = set(_FINANCE_CONFIG.get("finance_table_names", [
+    "FAGLFLEXA", "BKPF", "BSEG", "SKA1", "SKAT",
+    "CSKS", "CSKT", "T001", "TCURC", "TCURR",
+]))
+
+# Schema discovery cache
+_discovered_finance_tables: Optional[Set[str]] = None
+_discovered_tables_timestamp: float = 0.0
+_SCHEMA_CACHE_TTL = _FINANCE_CONFIG.get("schema_cache_ttl_seconds", 3600)
+_schema_discovery_tool = _FINANCE_CONFIG.get("schema_discovery_tool", "hana_list_tables")
+
+
 @dataclass
 class IntentResult:
-    intent: str                      # e.g., "leave_request", "policy_question", "profile_lookup"
-    intent_category: str             # "personal_data" | "aggregate_data" | "policy_info" | "action_request" | "emergency" | "grievance" | "greeting"
+    intent: str                      # e.g., "leave_request", "policy_question", "profile_lookup", "data_discovery"
+    intent_category: str             # "personal_data" | "aggregate_data" | "policy_info" | "data_discovery" | "action_request" | "emergency" | "grievance" | "greeting"
     data_scope: str                  # "individual" | "aggregate" | "none" — determines chart eligibility
     chart_eligible: bool             # True ONLY if aggregate data and not personal/action/emergency
     urgency_level: str               # "routine" | "time_sensitive" | "urgent" | "distressed"
@@ -32,6 +84,7 @@ class IntentResult:
     action_oriented: bool            # True if user wants to DO something
     wants_export: bool = False       # True if user explicitly asks to export/download data
     is_ambiguous: bool = False       # True if user's affirmation is ambiguous (multiple prior options)
+    finance_query: bool = False      # True if query involves SAP FI/CO finance data
 
 
 # Intent -> Category mapping (deterministic, no LLM needed for this)
@@ -70,9 +123,15 @@ INTENT_CATEGORY_MAP = {
     "skills_gap": "aggregate_data",
     "payroll_distribution": "aggregate_data",
     "attrition_risk": "aggregate_data",
+    # Finance / GL data (aggregate scope, CHART ELIGIBLE)
+    "finance_gl_analysis": "aggregate_data",
+    "finance_cost_analysis": "aggregate_data",
+    "finance_currency": "aggregate_data",
+    "finance_budget": "aggregate_data",
     # Policy / info (no data scope, NEVER chart)
     "policy_question": "policy_info",
     "general_hr": "policy_info",
+    "data_discovery": "data_discovery",
     # Greeting
     "greeting": "greeting",
     "smalltalk": "greeting",
@@ -105,7 +164,21 @@ _AFFIRMATIVE_WORDS = {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please
 _EXPORT_OFFER_KEYWORDS = ("export", "excel", "spreadsheet", "xlsx", "workbook", "download",
                           "save as", "send me the file", "get a file")
 _MULTI_OPTION_KEYWORDS = ("or would you prefer", "or", "instead", "which would you like",
-                          "choose one", "would you like me to", "shall i", "do you want")
+                           "choose one", "would you like me to", "shall i", "do you want")
+
+# SAP FI/CO tables available in HANA for finance queries
+_HANA_FINANCE_TABLES = {
+    "FAGLFLEXA", "BKPF", "BSEG", "SKA1", "SKAT",
+    "CSKS", "CSKT", "T001", "TCURC", "TCURR",
+}
+
+# Finance domain keywords (narrowed to avoid false positives from generic business terms)
+_FINANCE_KEYWORDS = {
+    "gl account", "general ledger", "bank details",
+    "exchange rate", "currency conversion",
+    "salary cost", "compensation cost", "benefits cost",
+    "overhead", "personnel cost", "labor cost", "fte cost",
+}
 
 _FULL_INFO_PATTERNS = [
     re.compile(r"\b(pull|get|show|give|fetch|send)\s+(me\s+)?(my\s+)?(full|complete|all|entire)\s+(the\s+)?(info|information|details|record|records|data|profile)\b", re.I),
@@ -114,6 +187,78 @@ _FULL_INFO_PATTERNS = [
     re.compile(r"\b(full|complete|all)\s+(record|records|info|information|details)\b", re.I),
     re.compile(r"\b(everything|raw\s+data|all\s+fields|all\s+columns)\s+(on\s+file|in\s+your\s+system|you\s+have)\b", re.I),
 ]
+
+
+def initialize_finance_tables(hana_client: Any = None) -> None:
+    """Discover finance tables from HANA schema at startup.
+
+    Queries HANA for tables matching finance prefixes, then caches the result.
+    If HANA is unavailable, falls back to the hardcoded fallback table list.
+    Called from agentic_executor.py at startup.
+    """
+    global _discovered_finance_tables, _discovered_tables_timestamp
+
+    if hana_client is None:
+        _discovered_finance_tables = None
+        _discovered_tables_timestamp = 0.0
+        return
+
+    try:
+        result = hana_client.call_tool(_schema_discovery_tool, {})
+        tables = set()
+        if isinstance(result, dict) and "rows" in result:
+            for row in result.get("rows", []):
+                if isinstance(row, dict):
+                    table_name = row.get("TABLE_NAME", row.get("table_name", ""))
+                    if table_name:
+                        tables.add(table_name)
+                elif isinstance(row, str):
+                    tables.add(row)
+        elif isinstance(result, list):
+            for item in result:
+                if isinstance(item, str):
+                    tables.add(item)
+
+        # Filter tables by finance prefixes
+        discovered = set()
+        for table in tables:
+            table_upper = table.upper()
+            for prefix in _FINANCE_TABLE_PREFIXES:
+                if table_upper.startswith(prefix.upper()):
+                    discovered.add(table_upper)
+                    break
+
+        _discovered_finance_tables = discovered if discovered else None
+        _discovered_tables_timestamp = time.time()
+        logger.info("Finance table discovery: found %d finance tables from HANA schema", len(discovered or set()))
+    except Exception as e:
+        logger.warning("Finance table discovery failed: %s. Using fallback tables.", e)
+        _discovered_finance_tables = None
+        _discovered_tables_timestamp = time.time()
+
+
+def _get_finance_tables() -> Set[str]:
+    """Return discovered finance tables (cached) or fallback tables."""
+    if _discovered_finance_tables is not None:
+        cache_age = time.time() - _discovered_tables_timestamp
+        if cache_age < _SCHEMA_CACHE_TTL:
+            return _discovered_finance_tables
+        # Cache expired, try rediscovery
+        logger.info("Finance table cache expired (%.0fs), re-discovery recommended", cache_age)
+    return _FINANCE_FALLBACK_TABLES
+
+
+def _detect_finance_query(query: str, finance_tables: Optional[Set[str]] = None) -> bool:
+    """Detect if query involves SAP FI/CO finance data from HANA tables."""
+    q = query.lower()
+    tables = finance_tables if finance_tables is not None else _get_finance_tables()
+    for table in tables:
+        if table.lower() in q:
+            return True
+    for kw in _FINANCE_KEYWORDS:
+        if kw in q:
+            return True
+    return False
 
 
 def _match_patterns(query: str, patterns: list) -> bool:
@@ -146,7 +291,7 @@ _CLASSIFIER_SYSTEM = """You are an intent classifier for an HR AI assistant.
 Analyze the user's query and classify it into structured categories.
 
 Return ONLY a JSON object with these exact keys:
-- intent: One of [greeting, smalltalk, leave_request, leave_balance, policy_question, profile_lookup, salary_question, org_hierarchy, emergency, medical, complaint, resignation, benefits_enrollment, profile_update, training_request, general_hr, department_count, gender_distribution, hiring_trend, salary_analysis, turnover_analysis, age_distribution, performance_distribution, leave_analysis, mc_trend, attendance_analysis, recruitment_funnel, compensation_ratio, headcount_budget, diversity_hiring, engagement_scores, skills_gap, payroll_distribution, attrition_risk]
+ - intent: One of [greeting, smalltalk, leave_request, leave_balance, policy_question, profile_lookup, salary_question, org_hierarchy, emergency, medical, complaint, resignation, benefits_enrollment, profile_update, training_request, general_hr, department_count, gender_distribution, hiring_trend, salary_analysis, turnover_analysis, age_distribution, performance_distribution, leave_analysis, mc_trend, attendance_analysis, recruitment_funnel, compensation_ratio, headcount_budget, diversity_hiring, engagement_scores, skills_gap, payroll_distribution, attrition_risk, finance_gl_analysis, finance_cost_analysis, finance_currency, finance_budget, data_discovery]
 - data_scope: One of [individual, aggregate, none]. "individual" = about a specific person (me, John, my profile). "aggregate" = about groups, departments, trends, distributions. "none" = no data needed (policy, greeting, action steps).
 - chart_eligible: boolean. TRUE only if the query is about aggregate data (group comparisons, distributions, trends, proportions) AND not about a specific person. FALSE for personal lookups, single values, action requests, policy questions, greetings.
 - urgency_level: One of [routine, time_sensitive, urgent, distressed]
@@ -166,6 +311,9 @@ Rules:
 - "medium" = leave disputes, salary issues, performance concerns, benefits
 - "low" = directory lookups, general policy questions, org chart queries, training info
 - data_scope = "aggregate" when user asks about: counts per department, gender distribution, hiring trends, average salary by level, turnover rate, age distribution, performance ratings, leave analysis, MC trends, headcount, recruitment funnel, engagement scores, skills gap, etc.
+- "How many X are in table Y?", "Count X in Y", or "Total X in Y" where Y is a database table is an AGGREGATE query with intent=aggregate_data or a finance intent like finance_gl_analysis/finance_budget. It is NOT data_discovery.
+- Data_discovery is ONLY when the user asks: "what data do you have?", "what's available?", "show me what you can access", "what tables exist?", "what schemas are there?" — questions about system capability, not data retrieval.
+- Questions asking for specific counts, totals, sums, averages, or actual data values from known tables/entities are aggregate_data, not data_discovery.
 - data_scope = "individual" when user asks about: my leave, John's salary, my profile, who is my manager, my balance, my department, my team.
 - data_scope = "none" for policy questions, how-to steps, greetings, small talk.
 - chart_eligible = TRUE when data_scope is "aggregate" AND the result would have multiple rows/categories to compare. FALSE when data_scope is "individual" or "none".
@@ -227,12 +375,13 @@ def classify_intent(user_query: str, conversation_history: str = "",
         # If intent not in map, infer from action_oriented + personal keywords
         category = INTENT_CATEGORY_MAP.get(intent)
         if not category:
-            # Fallback inference: never fails
             if result.get("action_oriented", False):
                 category = "action_request"
+            elif intent == "data_discovery":
+                category = "data_discovery"
             elif any(k in intent for k in ("salary", "profile", "leave", "benefit", "medical", "emergency")):
                 category = "personal_data"
-            elif any(k in intent for k in ("org", "department", "team", "count", "aggregate", "distribution", "trend", "analysis", "rate", "funnel", "engagement", "skills", "compensation", "payroll", "attrition", "headcount", "budget", "hiring")):
+            elif any(k in intent for k in ("org", "department", "team", "count", "aggregate", "distribution", "trend", "analysis", "rate", "funnel", "engagement", "skills", "compensation", "payroll", "attrition", "headcount", "budget", "hiring", "finance", "gl", "cost center", "currency", "exchange", "fx")):
                 category = "aggregate_data"
             else:
                 category = "policy_info"
@@ -279,6 +428,7 @@ def classify_intent(user_query: str, conversation_history: str = "",
             action_oriented=result.get("action_oriented", False),
             wants_export=wants_export,
             is_ambiguous=is_ambiguous,
+            finance_query=_detect_finance_query(user_query),
         )
     except Exception as e:
         logger.warning("Intent classification failed: %s. Falling back to neutral.", e)
@@ -295,4 +445,5 @@ def classify_intent(user_query: str, conversation_history: str = "",
             action_oriented=False,
             wants_export=False,
             is_ambiguous=False,
+            finance_query=False,
         )

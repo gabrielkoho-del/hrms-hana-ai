@@ -1,4 +1,4 @@
-"""agent/utils/odata_normalizer.py
+"""agent/dab/odata_normalizer.py
 
 Pre-call OData request normalization for DAB/OData strictness.
 

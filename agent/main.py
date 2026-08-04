@@ -16,6 +16,7 @@ import glob
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
+import numpy as np
 
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +30,8 @@ from contextlib import asynccontextmanager
 # ==============================
 # MODULE IMPORTS
 # ==============================
-from agent.excel_exporter import EXPORT_DIR, export_to_excel, cleanup_old_exports
-from agent.rag_retriever import rag_retriever, retrieve_policy_context
+from agent.output.excel_exporter import EXPORT_DIR, export_to_excel, cleanup_old_exports
+from agent.integrations.rag_retriever import rag_retriever, retrieve_policy_context
 
 from agent.auth import verify_token, AuthContext
 from agent.config import (
@@ -40,21 +41,29 @@ from agent.config import (
     UNLIMITED_ROWS, RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW_SECONDS,
     CONTEXT_WINDOW_SIZE, MAX_TOKENS
 )
-from agent.chart_generator import generate_chart, extract_chartable_data, CHART_OUTPUT_DIR
-from agent.tool_planner import build_tool_plan
-from agent.schema_index import warm_schema_index
+from agent.output.chart_generator import generate_chart, extract_chartable_data, CHART_OUTPUT_DIR
+from agent.core.tool_planner import build_tool_plan
+from agent.integrations.schema_index import (
+    warm_schema_index,
+    SchemaFieldIndex,
+    SCHEMA_INDEX_CACHE_DIR,
+    EMBEDDING_DIM,
+)
 
 # DAB client (replaces custom MCP SSE transport)
-from agent.dab_client import (
+from agent.integrations.dab_client import (
     DABClient, DABTenantClientManager, format_dab_entities_as_tools,
     format_dab_entities_for_prompt, invoke_dab_tool_with_retry
 )
 
 # HANA client integration
-from agent.hana_client import hana_manager
+from agent.integrations.hana_client import hana_manager
+
+# Schema registry service (replaces ad-hoc file I/O in agentic_executor)
+from agent.integrations.schema_registry import schema_registry_service
 
 # Reflexive agent executor
-from agent.agentic_executor import run_reflexive_agent
+from agent.core.agentic_executor import run_reflexive_agent
 
 # ==============================
 # LOGGING SETUP
@@ -71,6 +80,7 @@ logger = logging.getLogger("hr_agent")
 CACHED_TOOLS: List[Dict] = []
 CACHED_TOOLS_PROMPT: str = ""
 CACHED_SCHEMA: Dict = {}
+CACHED_HANA_SCHEMAS: Dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
@@ -91,8 +101,9 @@ dab_manager = DABTenantClientManager()
 async def discover_tools():
     """Discover tools and schema from DAB server and HANA MCP server."""
     global CACHED_TOOLS, CACHED_TOOLS_PROMPT, CACHED_SCHEMA
+    tool_lines = []
+    tenant_id = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
     try:
-        tenant_id = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
         logger.info("Discovering tools from tenant: %s", tenant_id)
         entities = dab_manager.get_entities(tenant_id, force_refresh=True)
 
@@ -108,23 +119,6 @@ async def discover_tools():
             schema_str = json.dumps(tool["function"]["parameters"], indent=2)
             tool_lines.append(f"- {name}: {desc}")
             tool_lines.append(f"  Schema: {schema_str}")
-
-        # Append HANA tools if HANA MCP is configured (static schemas, no network call)
-        try:
-            from agent.tool_planner import build_hana_tool_schemas
-            hana_schemas = build_hana_tool_schemas()
-            for tool in hana_schemas:
-                name = tool["function"]["name"]
-                desc = tool["function"]["description"]
-                schema_str = json.dumps(tool["function"]["parameters"], indent=2)
-                tool_lines.append(f"- {name}: {desc}")
-                tool_lines.append(f"  Schema: {schema_str}")
-            CACHED_TOOLS.extend(hana_schemas)
-            logger.info("Appended %d HANA tool schemas", len(hana_schemas))
-        except Exception as e:
-            logger.warning("HANA tool schema setup skipped: %s", e)
-
-        CACHED_TOOLS_PROMPT = "\n".join(tool_lines)
 
         logger.info("Discovered %d total tools", len(CACHED_TOOLS))
 
@@ -145,14 +139,38 @@ async def discover_tools():
         # or risk a 429. Uses the same tenant that discovery ran for.
         schema_index_ready = False
         if CACHED_SCHEMA:
-            index = await warm_schema_index(CACHED_SCHEMA, tenant_id=tenant_id)
-            if index is not None:
-                schema_index_ready = True
-            else:
-                logger.warning(
-                    "Startup schema index warmup FAILED. "
-                    "First semantic schema search will trigger live embedding API calls and may hit rate limits."
-                )
+            tmp_instance = SchemaFieldIndex(CACHED_SCHEMA, tenant_id=tenant_id)
+            cache_path = tmp_instance._cache_path()
+            if cache_path.exists():
+                try:
+                    data = np.load(cache_path, allow_pickle=False)
+                    cached_dim = int(data["embedding_dim"])
+                    if cached_dim == EMBEDDING_DIM:
+                        schema_index_ready = True
+                        logger.info(
+                            "Schema index cache exists at %s (dim=%d, age=%.0fs) — skipping warmup build.",
+                            cache_path.name,
+                            cached_dim,
+                            time.time() - float(data["built_at"]),
+                        )
+                    else:
+                        logger.warning(
+                            "Schema cache dim mismatch (cached=%d, config=%d) — rebuilding.",
+                            cached_dim,
+                            EMBEDDING_DIM,
+                        )
+                except Exception as e:
+                    logger.warning("Schema cache pre-check failed, will warm: %s", e)
+
+            if not schema_index_ready:
+                index = await warm_schema_index(CACHED_SCHEMA, tenant_id=tenant_id)
+                if index is not None:
+                    schema_index_ready = True
+                else:
+                    logger.warning(
+                        "Startup schema index warmup FAILED. "
+                        "First semantic schema search will trigger live embedding API calls and may hit rate limits."
+                    )
 
         if not schema_index_ready and CACHED_SCHEMA:
             logger.error(
@@ -162,10 +180,130 @@ async def discover_tools():
             )
 
     except Exception as e:
-        logger.error("Tool discovery failed: %s", e)
-        CACHED_TOOLS = []
-        CACHED_TOOLS_PROMPT = ""
-        CACHED_SCHEMA = {}
+        logger.error("DAB tool discovery failed: %s", e)
+
+    # HANA schema discovery — run once at startup (independent of DAB)
+    try:
+        from agent.integrations.hana_client import hana_manager
+        hana_schemas = await _discover_hana_schemas(tenant_id)
+        CACHED_HANA_SCHEMAS.clear()
+        CACHED_HANA_SCHEMAS.update(hana_schemas)
+        logger.info("Discovered %d HANA schemas at startup", len(hana_schemas))
+    except Exception as e:
+        logger.warning("HANA schema discovery failed: %s", e)
+
+    # HANA tool discovery (dynamic via MCP tools/list, with static fallback)
+    try:
+        from agent.integrations.hana_client import refresh_hana_tool_schemas
+        hana_tools = await refresh_hana_tool_schemas(tenant_id=tenant_id)
+
+        if not isinstance(hana_tools, list):
+            raise TypeError(
+                f"refresh_hana_tool_schemas() must return a list, got {type(hana_tools).__name__}"
+            )
+
+        invalid_tools = []
+        for tool in hana_tools:
+            if not isinstance(tool, dict):
+                invalid_tools.append({"tool": tool, "reason": "not a dict"})
+                continue
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                invalid_tools.append({"tool": tool, "reason": "missing function"})
+                continue
+            if not function.get("name"):
+                invalid_tools.append({"tool": tool, "reason": "missing function.name"})
+                continue
+
+        if invalid_tools:
+            raise ValueError(
+                f"refresh_hana_tool_schemas() returned invalid tools: {invalid_tools}"
+            )
+
+        CACHED_TOOLS.extend(hana_tools)
+        for tool in hana_tools:
+            name = tool["function"]["name"]
+            desc = tool["function"]["description"]
+            schema_str = json.dumps(tool["function"]["parameters"], indent=2)
+            tool_lines.append(f"- {name}: {desc}")
+            tool_lines.append(f"  Schema: {schema_str}")
+        logger.info("Appended %d HANA tool schemas", len(hana_tools))
+    except Exception as e:
+        logger.error("HANA tool schema setup failed: %s", e)
+        raise
+
+    CACHED_TOOLS_PROMPT = "\n".join(tool_lines)
+    logger.info("Discovered %d total tools", len(CACHED_TOOLS))
+
+
+async def _discover_hana_schemas(tenant_id: str) -> Dict[str, List[str]]:
+    """Discover HANA schemas and their tables once at startup.
+
+    Uses the SchemaRegistryService for cache loading and falls back
+    to live HANA discovery if no cache exists.
+    """
+    from agent.integrations.hana_client import hana_manager
+
+    # Try loading from the registry service first
+    cached = schema_registry_service.get_registry(tenant_id)
+    if cached:
+        logger.info("HANA schema loaded from registry service for tenant=%s (%d schemas)", tenant_id, len(cached))
+        return cached
+
+    # Live discovery via HANA MCP
+    client = hana_manager.get_client(tenant_id)
+    schemas: Dict[str, List[str]] = {}
+
+    try:
+        list_schemas_result = client.call_tool("hana_list_schemas", {})
+        normalized_schemas = _normalize_name_list(list_schemas_result)
+
+        for schema_name in normalized_schemas:
+            try:
+                list_tables_result = client.call_tool("hana_list_tables", {"schema_name": schema_name})
+                tables = _normalize_name_list(list_tables_result)
+                if tables:
+                    schemas[schema_name] = tables
+                    logger.info("HANA schema: %s (%d tables)", schema_name, len(tables))
+            except Exception as e:
+                logger.warning("HANA list_tables failed for schema=%s: %s", schema_name, e)
+
+        # Persist to registry service and disk
+        schema_registry_service._registries[tenant_id.upper()] = schemas
+        cache_file = schema_registry_service._tenant_cache_path(tenant_id)
+        schema_registry_service._cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump({"schemas": schemas, "updated_at": time.time()}, f)
+        logger.info("HANA schema cache saved to disk (%d schemas)", len(schemas))
+
+        # Enrich with business semantics via hana_explain_table
+        try:
+            schema_registry_service.enrich_schema_with_semantics(
+                tenant_id, schemas, hana_manager.get_client(tenant_id), max_tables=50
+            )
+        except Exception as e:
+            logger.warning("HANA schema semantics enrichment failed: %s", e)
+    except Exception as e:
+        logger.error("HANA schema discovery failed: %s", e)
+
+    return schemas
+
+
+def _normalize_name_list(result: Any) -> List[str]:
+    """Parse HANA list response from the current Streamable HTTP server.
+
+    Modern `hana_list_schemas` / `hana_list_tables` return
+    `structuredContent.items` populated by formatNameListToolResult().
+    """
+    if not isinstance(result, dict):
+        return []
+    structured = result.get("structuredContent")
+    if not isinstance(structured, dict):
+        return []
+    names = structured.get("items") or []
+    return [str(n).upper() for n in names if n]
+
+
 
 
 # ==============================
@@ -296,13 +434,26 @@ async def lifespan(app: FastAPI):
         rag_retriever.initialize()
     cleanup_old_exports()
     os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
-    # Warm up HANA client if configured
-    if os.getenv("HANAMCP_HTTP_URL"):
-        try:
-            hana_manager.get_client("LOCALDEV")
-            logger.info("HANA MCP client warmed up at startup")
-        except Exception as e:
-            logger.warning("HANA MCP warmup failed: %s", e)
+
+    # Load all HANA schema registries at startup (per-tenant, in-memory)
+    registry_summary = schema_registry_service.load_all_tenants()
+    logger.info(
+        "SchemaRegistry: startup loaded %d tenants: %s",
+        len(registry_summary),
+        ", ".join(f"{t}={c}" for t, c in registry_summary.items()),
+    )
+    # Keep CACHED_HANA_SCHEMAS populated for backward compatibility
+    CACHED_HANA_SCHEMAS.clear()
+    for tenant_id, schemas in schema_registry_service._registries.items():
+        CACHED_HANA_SCHEMAS.update(schemas)
+
+    # Warm up the same HANA tenant used for DAB discovery (no separate LOCALDEV)
+    discovery_tenant = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
+    try:
+        hana_manager.get_client(discovery_tenant)
+        logger.info("HANA MCP client warmed up for discovery tenant: %s", discovery_tenant)
+    except Exception as e:
+        logger.info("HANA MCP warmup skipped or unavailable for tenant %s: %s", discovery_tenant, e)
     yield
     dab_manager.close_all()
     hana_manager.close_all()
@@ -525,6 +676,7 @@ async def health(auth_context: AuthContext = Depends(verify_token)):
     rag_status = "available" if rag_retriever.is_available() else "unavailable"
     export_count = len(glob.glob(os.path.join(EXPORT_DIR, "*.xlsx")))
     chart_count = len(glob.glob(os.path.join(CHART_OUTPUT_DIR, "chart_*.png")))
+    registry_summary = schema_registry_service.get_summary()
     return {
         "status": "ok",
         "rag": rag_status,
@@ -540,6 +692,7 @@ async def health(auth_context: AuthContext = Depends(verify_token)):
         "roles": auth_context.internal_roles,
         "permissions": sorted(auth_context.permissions),
         "agent_mode": AGENT_MODE,
+        "schema_registry": registry_summary,
     }
 
 

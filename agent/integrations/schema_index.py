@@ -57,9 +57,15 @@ def _get_embed_client() -> "_GeminiEmbeddingClient":
 
 
 def _schema_hash(schema: Dict) -> str:
-    """Stable hash for schema dict, used as cache key instead of id()."""
+    """Stable hash for schema dict. Sorts lists to ensure deterministic output."""
+    def _stable_dump(obj):
+        if isinstance(obj, dict):
+            return {k: _stable_dump(v) for k, v in sorted(obj.items())}
+        if isinstance(obj, list):
+            return sorted((_stable_dump(item) for item in obj), key=str)
+        return obj
     return hashlib.md5(
-        json.dumps(schema, sort_keys=True, default=str).encode()
+        json.dumps(_stable_dump(schema), default=str).encode()
     ).hexdigest()[:16]
 
 

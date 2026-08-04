@@ -13,6 +13,7 @@ node_modules/
 chroma_db/
 data/
 .kilo/
+agent/charts/
 
 # IDE / OS
 .vscode/

@@ -1,15 +1,13 @@
 # agent/tool_planner.py
-"""Tool planning module for DAB (Data API Builder) — native tool calling + JSON fallback.
+"""Tool planning module for DAB (Data API Builder) — native tool calling.
 
-Production-grade dual-path architecture:
-  Path 1 (primary): Native OpenAI tool calling — model emits structured tool_calls.
-  Path 2 (fallback): Text-based JSON parsing — for models/tool configs that don't support tool calling.
+Production-grade architecture:
+  Native OpenAI tool calling — model emits structured tool_calls.
 
 All previous fixes preserved:
   • asyncio.to_thread for non-blocking LLM calls
-  • Non-greedy JSON regex
-  • Aligned client-side binning example
   • Schema-driven entity normalization
+  • Aligned client-side binning example
 """
 import asyncio
 import json
@@ -19,26 +17,46 @@ import time
 import logging
 from typing import List, Dict, Optional, Any
 
-from agent.llm_client import call_llm
-from agent.config import DEFAULT_MAX_ROWS, LARGE_RESULT_THRESHOLD, UNLIMITED_ROWS
+import jsonschema
+import tiktoken
 
-try:
-    from agent.hana_client import HANA_TOOL_NAMES
-    _HANA_TOOLS_AVAILABLE = True
-except Exception:
-    HANA_TOOL_NAMES = []
-    _HANA_TOOLS_AVAILABLE = False
+from agent.integrations.llm_client import call_llm
+from agent.config import DEFAULT_MAX_ROWS, LARGE_RESULT_THRESHOLD, UNLIMITED_ROWS, PLANNER_ESTIMATED_TOKENS, CONVERSATION_HISTORY_TOKEN_BUDGET
+from agent.core.prompts import (
+    build_tone_aware_guidance,
+    build_dab_tool_schemas,
+    build_hana_tool_schemas,
+    build_all_tool_schemas,
+    build_tool_calling_system_prompt,
+)
+from agent.output.binning import (
+    BINNING_MAP,
+    _resolve_binning_column,
+    _derive_y_label,
+)
 
 logger = logging.getLogger("hr_agent")
 
+_PLANNER_TIMEOUT_SECONDS = 30
+
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TOKENIZER — Gemini SentencePiece approximation
+# TOKENIZER — Industry standard: real tokenizer when available
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _count_tokens(text: str) -> int:
-    """Gemini SentencePiece approximation: ~3.5 chars per token."""
-    return int(len(text) / 3.5)
+    """Count tokens using tiktoken (OpenAI-compatible) with safe fallback.
+
+    Uses cl100k_base encoding, which matches GPT-4/OpenAI tool-calling models.
+    For Gemini OpenAI-compatible endpoint, this provides accurate token counts
+    for prompt budget enforcement without impacting free tier limits.
+    """
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text, disallowed_special=()))
+    except Exception:
+        # Fallback: conservative approximation (slightly overestimates)
+        return int(len(text) / 3.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -112,7 +130,7 @@ async def _retrieve_relevant_fields(
 
     # For large schemas, use embedding retrieval via schema_index
     try:
-        from agent.schema_index import search_relevant_fields
+        from agent.integrations.schema_index import search_relevant_fields
         return await search_relevant_fields(user_query, schema, tenant_id=tenant_id, top_k=top_k)
     except Exception as e:
         logger.warning("Embedding retrieval failed: %s. Returning full schema.", e)
@@ -134,84 +152,8 @@ async def _retrieve_relevant_fields(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BINNING CONFIGURATION — Flexible column-name matching for multi-tenant schemas
+# BINNING CONFIGURATION — imported from agent/output/binning.py (single source)
 # ═════════════════════════════════════════════════════════════════════════════
-
-BINNING_MAP = {
-    "age": {
-        "aliases": {
-            "age", "date_of_birth", "dob", "birth_date", "birthdate",
-            "dateofbirth", "birthday", "date_birth", "d_o_b"
-        },
-        "config": {
-            "method": "post_aggregate",
-            "column": "age",
-            "bins": [18, 25, 35, 45, 55, 100],
-            "labels": ["18-25", "26-35", "36-45", "46-55", "56+"]
-        }
-    },
-    "salary": {
-        "aliases": {
-            "salary", "basic_salary", "gross_salary", "net_salary",
-            "monthly_salary", "annual_salary", "pay", "wage",
-            "compensation", "remuneration", "basic_pay", "total_salary"
-        },
-        "config": {
-            "method": "post_aggregate",
-            "column": "salary",
-            "bins": [0, 3000, 5000, 8000, 12000, 999999],
-            "labels": ["<3K", "3-5K", "5-8K", "8-12K", "12K+"]
-        }
-    },
-    "tenure": {
-        "aliases": {
-            "tenure", "years_of_service", "service_years", "length_of_service",
-            "employment_duration", "years_with_company", "company_tenure",
-            "service_length", "service_duration"
-        },
-        "config": {
-            "method": "post_aggregate",
-            "column": "tenure",
-            "bins": [0, 1, 3, 5, 10, 100],
-            "labels": ["<1yr", "1-3yr", "3-5yr", "5-10yr", "10yr+"]
-        }
-    }
-}
-
-
-def _resolve_binning_column(raw_col: str) -> Optional[str]:
-    """Map a raw column name to its canonical binning type using aliases.
-
-    Exact match first, then suffix/prefix match for compound names
-    (e.g., "basic_salary" -> "salary").
-    """
-    col_lower = raw_col.lower().strip().replace(" ", "_")
-    # Exact match
-    for canonical, meta in BINNING_MAP.items():
-        if col_lower in meta["aliases"]:
-            return canonical
-    # Secondary: suffix/prefix match (e.g., "basic_salary" contains "salary")
-    for canonical, meta in BINNING_MAP.items():
-        if col_lower.endswith(f"_{canonical}") or col_lower.startswith(f"{canonical}_"):
-            return canonical
-    return None
-
-
-def _derive_y_label(func: str, entity: str, field: str) -> str:
-    """Derive human-readable y-axis label from aggregation context."""
-    entity_singular = entity.rstrip("s") if entity else "Employee"
-    if func == "count":
-        return f"Number of {entity_singular.title()}s"
-    if func == "sum":
-        return f"Total {field.replace('_', ' ').title()}"
-    if func == "avg":
-        return f"Average {field.replace('_', ' ').title()}"
-    if func == "min":
-        return f"Minimum {field.replace('_', ' ').title()}"
-    if func == "max":
-        return f"Maximum {field.replace('_', ' ').title()}"
-    return field.replace("_", " ").title() if field else "Value"
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # EMPTY PLAN & NORMALIZATION
@@ -504,118 +446,6 @@ def validate_dab_filter_permissions(filter_str: str, entity: str, auth_context: 
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# JSON PARSING (fallback path)
-# ═════════════════════════════════════════════════════════════════════════════
-def parse_json_from_text(text: str) -> Dict:
-    code_block_match = re.search(r'```(?:json)?\s*(.*?)```', text, re.DOTALL)
-    if code_block_match:
-        text = code_block_match.group(1)
-
-    match = re.search(r"\{.*?\}", text, re.DOTALL)
-    if not match:
-        return _empty_plan()
-
-    try:
-        parsed = json.loads(match.group())
-        return _normalize_plan(parsed)
-    except json.JSONDecodeError:
-        pass
-
-    return _extract_plan_with_regex(text)
-
-
-def _extract_plan_with_regex(text: str) -> Dict:
-    plan = _empty_plan()
-
-    reasoning_match = re.search(r'"reasoning"\s*:\s*"([^"]+)"', text)
-    if reasoning_match:
-        plan["reasoning"] = reasoning_match.group(1)
-
-    direct_match = re.search(r'"direct_answer"\s*:\s*"([^"]*)"', text)
-    if direct_match:
-        plan["direct_answer"] = direct_match.group(1)
-        return plan
-
-    steps_match = re.search(r'"steps"\s*:\s*(\[.*?\])', text, re.DOTALL)
-    if steps_match:
-        try:
-            plan["steps"] = json.loads(steps_match.group(1))
-        except:
-            pass
-
-    logger.warning("Used minimal regex fallback. Steps: %d", len(plan["steps"]))
-    return plan
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TONE-AWARE TOOL SELECTION
-# ═════════════════════════════════════════════════════════════════════════════
-def build_tone_aware_guidance(tone_context: Dict) -> str:
-    if not tone_context:
-        return ""
-
-    guidance_parts = []
-    category = tone_context.get("intent_category", "policy_info")
-    urgency = tone_context.get("urgency_level", "routine")
-    emotional = tone_context.get("emotional_state", "neutral")
-    needs_empathy = tone_context.get("needs_empathy", False)
-    action_oriented = tone_context.get("action_oriented", False)
-
-    if category in ("personal_data", "emergency"):
-        guidance_parts.append(
-            "- PERSONAL DATA QUERY: Fetch the user's personal record FIRST. "
-            "For leave: fetch BOTH entitlement AND balance. "
-            "For profile: fetch all relevant fields. "
-            "Never present generic policy as personal data."
-        )
-
-    if category == "action_request":
-        guidance_parts.append(
-            "- ACTION REQUEST: The user wants to DO something. "
-            "Fetch all prerequisites they need to complete the action: "
-            "eligibility, current status, required approvals, contact info. "
-            "Include an 'action_context' describing the specific action."
-        )
-
-    if category == "grievance":
-        guidance_parts.append(
-            "- GRIEVANCE QUERY: Be sensitive. Fetch relevant records (if any) "
-            "and include grievance officer or HR contact info in action_context."
-        )
-
-    if category == "aggregate_data":
-        guidance_parts.append(
-            "- AGGREGATE QUERY: The user wants organizational data. "
-            "Use aggregate_records when possible. Respect permission filters. "
-            "If the schema lacks pre-computed bins (age_group, tenure_group, salary_band), "
-            "fetch raw values and set client_side_binning for dynamic binning."
-        )
-
-    if category == "policy_info":
-        guidance_parts.append(
-            "- POLICY QUERY: The user wants to know a rule or procedure. "
-            "Set rag: true to fetch policy documents. Keep data queries minimal."
-        )
-
-    if needs_empathy or emotional in ("anxious", "distressed", "frustrated"):
-        guidance_parts.append(
-            "- The user is in an emotional state. Prioritize fetching their personal data (profile, leave balance, "
-            "manager info) so the response can be personalized and supportive, not generic policy text."
-        )
-
-    if urgency in ("urgent", "distressed", "time_sensitive"):
-        guidance_parts.append(
-            "- This is time-sensitive. Prioritize tools that give immediate actionable information. "
-            "Avoid tools that return large datasets requiring analysis."
-        )
-
-    if not guidance_parts:
-        return ""
-
-    return "\nTONE-AWARE CONTEXT (use these hints to reason about tool selection):\n" + "\n".join(guidance_parts)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # NATIVE TOOL CALLING — OpenAI-compatible schemas for DAB tools
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -737,119 +567,97 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
     return [read_records_schema, aggregate_records_schema, describe_entities_schema]
 
 
-def build_hana_tool_schemas() -> List[Dict]:
-    """Build OpenAI function-calling schemas for SAP HANA MCP tools."""
-    hana_execute_query = {
-        "type": "function",
-        "function": {
-            "name": "hana_execute_query",
-            "description": (
-                "Execute SQL against SAP HANA finance database. "
-                "Use for finance/GL queries, cost centers, balance sheets, etc. "
-                "Supports SELECT/WITH; results include columns and rows."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "SQL query to execute against HANA"
-                    },
-                    "maxRows": {
-                        "type": "number",
-                        "description": "Max rows to return"
-                    },
-                    "includeTotal": {
-                        "type": "boolean",
-                        "description": "If true, also return total row count"
-                    }
-                },
-                "required": ["query"]
+def build_hana_tool_schemas(tenant_id: Optional[str] = None) -> List[Dict]:
+    """Build OpenAI function-calling schemas for SAP HANA MCP tools.
+
+    Uses dynamically discovered tool schemas when available, otherwise
+    falls back to the static schema list.
+    """
+    from agent.integrations.hana_client import get_cached_hana_tool_schemas
+    return get_cached_hana_tool_schemas(tenant_id=tenant_id)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TOOL SCHEMA VALIDATION — Fail fast on invalid tool arguments
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Cached tool schemas for validation: {tool_name: {properties, required}}
+_TOOL_SCHEMA_MAP: Dict[str, Dict] = {}
+
+
+def _build_tool_schema_map(cached_schema: Dict, include_hana: bool = True) -> Dict[str, Dict]:
+    """Build a lookup map of tool_name -> {properties, required} for validation."""
+    global _TOOL_SCHEMA_MAP
+    schemas = build_all_tool_schemas(cached_schema, include_hana=include_hana)
+    _TOOL_SCHEMA_MAP = {}
+    for schema in schemas:
+        func = schema.get("function", {})
+        name = func.get("name")
+        if name:
+            params = func.get("parameters", {})
+            _TOOL_SCHEMA_MAP[name] = {
+                "properties": params.get("properties", {}),
+                "required": params.get("required", []),
             }
-        }
-    }
-
-    hana_describe_table = {
-        "type": "function",
-        "function": {
-            "name": "hana_describe_table",
-            "description": "Describe the structure of a HANA table (columns, types).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "table_name": {"type": "string", "description": "Table name"},
-                    "schema_name": {"type": "string", "description": "Schema name (optional)"},
-                    "catalog_database": {"type": "string", "description": "MDC catalog database (optional)"}
-                },
-                "required": ["table_name"]
-            }
-        }
-    }
-
-    hana_list_tables = {
-        "type": "function",
-        "function": {
-            "name": "hana_list_tables",
-            "description": "List tables in a HANA schema with optional prefix filter.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "schema_name": {"type": "string", "description": "Schema name (optional)"},
-                    "prefix": {"type": "string", "description": "Table name prefix filter (optional)"},
-                    "limit": {"type": "number", "description": "Max tables to return (optional)"},
-                    "offset": {"type": "number", "description": "Pagination offset (optional)"}
-                },
-                "required": []
-            }
-        }
-    }
-
-    hana_get_sample_data = {
-        "type": "function",
-        "function": {
-            "name": "hana_get_sample_data",
-            "description": "Fetch sample rows from a HANA table (SELECT TOP N).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "table_name": {"type": "string", "description": "Table name"},
-                    "schema_name": {"type": "string", "description": "Schema name (optional)"},
-                    "limit": {"type": "number", "description": "Number of rows (default 10, max 1000)"}
-                },
-                "required": ["table_name"]
-            }
-        }
-    }
-
-    return [hana_execute_query, hana_describe_table, hana_list_tables, hana_get_sample_data]
+    return _TOOL_SCHEMA_MAP
 
 
-def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True) -> List[Dict]:
+def validate_tool_args(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Validate tool arguments against the registered JSON schema.
+
+    Returns error message string if validation fails, None if valid.
+    """
+    schema = _TOOL_SCHEMA_MAP.get(tool_name)
+    if not schema:
+        return None  # No schema registered; allow through
+
+    try:
+        jsonschema.validate(instance=args, schema=schema)
+        return None
+    except jsonschema.ValidationError as e:
+        return f"Invalid arguments for {tool_name}: {e.message}"
+
+
+def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True, tenant_id: Optional[str] = None) -> List[Dict]:
     """Merge DAB and HANA tool schemas for the planner prompt.
 
     Args:
         cached_schema: DAB entity schema map.
         include_hana: If True, append HANA schemas (requires HANA server reachable).
+        tenant_id: Tenant identifier for HANA tool cache lookup.
     """
     schemas = list(build_dab_tool_schemas(cached_schema))
     if include_hana:
-        schemas.extend(build_hana_tool_schemas())
+        schemas.extend(build_hana_tool_schemas(tenant_id=tenant_id))
     return schemas
 
 
 _ALL_DAB_TOOLS = {"read_records", "aggregate_records", "describe_entities"}
-_ALL_HANA_TOOLS = set(HANA_TOOL_NAMES)
 
 
-def extract_steps_from_tool_calls(tool_calls: List[Dict], allowed_tools: Optional[set] = None) -> List[Dict]:
+def extract_steps_from_tool_calls(
+    tool_calls: List[Dict],
+    allowed_tools: Optional[set] = None,
+    tool_schema_map: Optional[Dict[str, Dict]] = None,
+    tenant_id: Optional[str] = None,
+) -> List[Dict]:
     """Convert LLM tool_calls to plan steps.
 
     Args:
         tool_calls: Raw tool_calls from LLM response.
-        allowed_tools: Set of tool names to permit. If None, allow DAB + HANA core tools.
+        allowed_tools: Set of tool names to permit. If None, allow DAB + dynamically discovered HANA tools.
+        tool_schema_map: Optional map of tool_name -> schema for argument validation.
+        tenant_id: Tenant identifier for HANA tool cache lookup.
     """
     if allowed_tools is None:
-        allowed_tools = _ALL_DAB_TOOLS | _ALL_HANA_TOOLS
+        from agent.integrations.hana_client import get_cached_hana_tool_schemas
+        hana_schemas = get_cached_hana_tool_schemas(tenant_id=tenant_id)
+        hana_tools = {
+            s["function"]["name"]
+            for s in hana_schemas
+            if isinstance(s, dict) and s.get("function", {}).get("name")
+        }
+        allowed_tools = _ALL_DAB_TOOLS | hana_tools
 
     steps = []
     for tc in tool_calls:
@@ -859,9 +667,18 @@ def extract_steps_from_tool_calls(tool_calls: List[Dict], allowed_tools: Optiona
             continue
         try:
             args = json.loads(tc["function"]["arguments"])
-            steps.append({"tool": tool_name, "args": args})
         except json.JSONDecodeError as e:
             logger.warning("Failed to parse tool arguments for %s: %s", tool_name, e)
+            continue
+
+        # Validate args against tool schema if available
+        if tool_schema_map and tool_name in tool_schema_map:
+            validation_error = validate_tool_args(tool_name, args)
+            if validation_error:
+                logger.warning("LLM tool arg validation failed for %s: %s — skipping", tool_name, validation_error)
+                continue
+
+        steps.append({"tool": tool_name, "args": args})
     return steps
 
 
@@ -932,7 +749,7 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
 
     # HANA queries use raw SQL; skip DAB chart/binning metadata inference
     if has_hana and not has_aggregate and not has_read:
-        metadata["reasoning"] = f"Selected {len(steps)} HANA tool(s) for finance data."
+        metadata["reasoning"] = f"Selected {len(steps)} HANA tool(s) for direct SQL query."
         return metadata
 
     # ── Chart inference (intent category + data shape, NOT keywords) ──
@@ -1076,177 +893,6 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
 # SYSTEM PROMPTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def build_tool_calling_system_prompt(
-    schema_block: str,
-    entity_list: str,
-    user_context: str,
-    rag_status: str,
-    tone_guidance: str = "",
-) -> str:
-    """Compact system prompt for native tool calling mode.
-
-    Much shorter than JSON mode prompt because tool schemas carry parameter definitions.
-    """
-    parts = [
-        "You are an HR AI agent with DAB data access. Use the available tools to fetch data. "
-        "Call the appropriate tool when you need to query the database. "
-        "You may call multiple tools if needed. "
-        "For greetings or smalltalk, do not call any tools.",
-        "",
-        schema_block,
-        "",
-        "Entities: " + entity_list,
-        "",
-        "RAG: " + rag_status + ".",
-    ]
-
-    if user_context:
-        parts.extend(["", user_context])
-    if tone_guidance:
-        parts.extend(["", tone_guidance])
-
-    parts.extend([
-        "",
-        "ENTITY NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The entity 'Employees' is NOT the same as 'employees' or 'employee'. Use the exact PascalCase names shown in the schema above. NEVER lowercase, NEVER snake_case, NEVER pluralize or singularize. If the schema says 'Employees', you MUST use 'Employees' exactly.",
-        "",
-        "FIELD NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The field 'EMAIL' is NOT the same as 'email'. The field 'FULL_NAME' is NOT 'full_name'. Use the EXACT field names shown in the schema above — copy them character-for-character into select, filter, orderby, groupby, and field parameters. This applies to ALL OData arguments: select='EMAIL,FULL_NAME', filter='EMAIL eq value', orderby=['BASIC_SALARY desc'], groupby=['DEPARTMENT']. NEVER guess or normalize field names.",
-        "",
-        "CHART RULES:",
-        "- Pre-binned data (age_group, salary_range) -> bar. Raw numeric distribution -> hist.",
-        "- Mermaid supports: bar, barh, pie, line. Matplotlib ONLY: hist, box.",
-        "- Under CHART_MODE=auto, hist/box always route to matplotlib.",
-        "- No charts for: personal data, single value, <5 rows, action queries, policy questions.",
-        "- Time dimension -> line. Proportion <=8 cats -> pie. Otherwise -> barh (default).",
-        "",
-        "DYNAMIC BINNING (multi-tenant):",
-        "If schema lacks pre-computed bins (age_group, salary_band): fetch raw values via aggregate_records groupby [raw_col] first:100, then set client_side_binning in plan.",
-        "",
-        "HANA (SAP HANA finance data):",
-        "- Use hana_execute_query for finance/GL/cost-center SQL queries.",
-        "- Use hana_describe_table / hana_list_tables for HANA schema discovery.",
-        "- HANA tools return {'columns': [...], 'rows': [...]}; the system normalizes them automatically.",
-        "- HANA queries do NOT support OData filters; write plain SQL.",
-        "",
-        "CRITICAL RULES:",
-        "- Personal queries (my leave, my salary): fetch DB record FIRST. Policy is REFERENCE ONLY. Never substitute policy for personal data.",
-        "- Self-referential: filter by auth_context email/emp_id. NEVER query others if read:self.",
-        "- If personal record is 0 rows: state 'I checked your records and do not see [X] on file.' Then MAY cite general policy as reference only.",
-    ])
-
-    return "\n".join(parts)
-
-
-def build_json_fallback_system_prompt(
-    schema_block: str,
-    entity_list: str,
-    user_context: str,
-    rag_status: str,
-    tone_guidance: str = "",
-) -> str:
-    """Full system prompt for JSON fallback mode (when tool calling fails)."""
-    parts = [
-        "You are an HR AI agent with DAB data access. Reason: DISCOVER entity -> REASON fields/filters -> QUERY with correct tool. First char = {. Last char = }. NO markdown fences. NO text outside JSON.",
-        "",
-        schema_block,
-        "",
-        "Entities: " + entity_list,
-        "",
-        "TOOLS:",
-        "- read_records(entity, select, filter, orderby, first): OData filter uses eq, ne, gt, ge, lt, le, and, or, not. Text filters do NOT support contains/LIKE — use exact eq or fetch broader. orderby: [\"salary desc\"]. first: max rows (default " + str(DEFAULT_MAX_ROWS) + ", use " + str(UNLIMITED_ROWS) + " for 'all').",
-        "- aggregate_records(entity, function, field, groupby, orderby, filter, first, having): function = count|sum|avg|min|max. Use * for count. groupby for grouped results. first for max groups. DATE: use pre-computed hire_year/hire_month — NEVER year(hire_date).",
-        "- describe_entities(): Discover fields. Use only when uncertain.",
-        "",
-        "RAG: " + rag_status + ".",
-    ]
-
-    if user_context:
-        parts.extend(["", user_context])
-    if tone_guidance:
-        parts.extend(["", tone_guidance])
-
-    parts.extend([
-        "",
-        "ENTITY NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The entity 'Employees' is NOT the same as 'employees' or 'employee'. Use the exact PascalCase names shown in the schema above. NEVER lowercase, NEVER snake_case, NEVER pluralize or singularize. If the schema says 'Employees', you MUST use 'Employees' exactly.",
-        "",
-        "CHART RULES:",
-        "- Pre-binned data (age_group, salary_range) -> bar/barh. Raw numeric distribution -> hist.",
-        "- Mermaid supports: bar, barh, pie, line. Matplotlib ONLY: hist, box.",
-        "- Under CHART_MODE=auto, hist/box always route to matplotlib.",
-        "- No charts for: personal data, single value, <5 rows, action queries, policy questions.",
-        "- Time dimension -> line. Proportion <=8 cats -> pie. Otherwise -> barh (default).",
-        "",
-        "DYNAMIC BINNING (multi-tenant):",
-        "If schema lacks pre-computed bins (age_group, salary_band): fetch raw values via aggregate_records groupby [raw_col] first:100, then set client_side_binning in plan.",
-        "",
-        "CRITICAL RULES:",
-        "- Personal queries (my leave, my salary): fetch DB record FIRST. Policy is REFERENCE ONLY. Never substitute policy for personal data.",
-        "- Self-referential: filter by auth_context email/emp_id. NEVER query others if read:self.",
-        "- If personal record is 0 rows: state 'I checked your records and do not see [X] on file.' Then MAY cite general policy as reference only.",
-        "",
-        "OUTPUT FORMAT — RAW JSON ONLY:",
-        '{"reasoning": "brief analysis", "steps": [{"tool": "read_records", "args": {...}}], "chart": {"type": "bar", "x_column": "", "y_column": "", "title": ""}, "rag": false, "rag_query": "", "needs_export": false, "direct_answer": "", "action_context": "", "client_side_binning": null}',
-        "",
-        "client_side_binning format (when schema lacks pre-computed bins):",
-        '{"method": "post_aggregate", "column": "age", "bins": [18, 25, 35, 45, 55, 100], "labels": ["18-25", "26-35", "36-45", "46-55", "56+"]}',
-        "",
-        "RULES: steps=[] for greetings. chart can be null. client_side_binning can be null. Never omit keys. First char = {. Last char = }."
-    ])
-
-    return "\n".join(parts)
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PLAN EXTRACTOR — Shared between tool calling and JSON fallback
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _build_plan_from_choice(choice) -> Optional[Dict]:
-    """Extract and validate a plan from an LLM choice (JSON fallback path)."""
-    if not choice:
-        return None
-    msg = choice.get("message", {})
-
-    content = msg.get("content", "")
-    if not content:
-        logger.warning("Planner: LLM returned empty content. finish_reason=%s", msg.get("finish_reason"))
-        return None
-
-    parsed = parse_json_from_text(content)
-    allowed_tools = {"read_records", "aggregate_records", "describe_entities"}
-    filtered_steps = [s for s in parsed.get("steps", []) if s.get("tool") in allowed_tools]
-    if len(filtered_steps) != len(parsed.get("steps", [])):
-        logger.warning("Filtered out unauthorized tools from parsed plan")
-
-    plan = {
-        "steps": filtered_steps,
-        "direct_answer": parsed.get("direct_answer", ""),
-        "chart": parsed.get("chart"),
-        "rag": parsed.get("rag", False),
-        "rag_query": parsed.get("rag_query", ""),
-        "needs_export": parsed.get("needs_export", False),
-        "reasoning": parsed.get("reasoning", ""),
-        "action_context": parsed.get("action_context", ""),
-        "client_side_binning": parsed.get("client_side_binning"),
-    }
-
-    if not plan["steps"] and not plan["direct_answer"]:
-        logger.warning("Planner: parsed plan has no steps and no direct_answer")
-        return None
-
-    if plan["steps"]:
-        logger.info("Parsed tool plan: %s | reasoning: %s | action_context: %s | client_side_binning: %s",
-                   [s["tool"] for s in plan["steps"]],
-                   plan.get("reasoning", "")[:200],
-                   plan.get("action_context", "")[:100],
-                   "YES" if plan.get("client_side_binning") else "NO")
-    if plan.get("direct_answer"):
-        logger.info("Direct answer from parsed JSON | reasoning: %s", plan.get("reasoning", "")[:200])
-
-    return plan
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN PLANNER — Dual-path: native tool calling (primary) -> JSON fallback
-# ═════════════════════════════════════════════════════════════════════════════
 async def build_tool_plan(
     user_query: str,
     conversation_history: str,
@@ -1257,13 +903,9 @@ async def build_tool_plan(
     default_max_rows: int = DEFAULT_MAX_ROWS,
     rag_available: bool = False,
     tone_context: Optional[Dict] = None,
+    hana_schema_registry: Optional[Dict[str, List[str]]] = None,
 ) -> Dict:
-    """Build an agentic, permission-aware tool plan for DAB.
-
-    Dual-path architecture:
-      1. Native tool calling (primary) — model emits structured tool_calls.
-      2. JSON text parsing (fallback) — for compatibility or tool-calling failures.
-    """
+    """Build an agentic, permission-aware tool plan for DAB using native tool calling."""
     if not cached_tools:
         return _empty_plan()
 
@@ -1286,29 +928,70 @@ async def build_tool_plan(
 
     full_query = user_query
     if conversation_history:
+        history_tokens = _count_tokens(conversation_history)
+        if history_tokens > CONVERSATION_HISTORY_TOKEN_BUDGET:
+            logger.warning(
+                "Conversation history exceeds token budget (%d > %d). Truncating.",
+                history_tokens, CONVERSATION_HISTORY_TOKEN_BUDGET
+            )
+            # Truncate from the start to preserve most recent context
+            # Rough truncation by character budget: keep the tail that fits
+            budget_chars = CONVERSATION_HISTORY_TOKEN_BUDGET * 3  # conservative chars-per-token
+            truncated = conversation_history[-budget_chars:]
+            # Try to start at a newline to avoid mid-message cuts
+            newline_idx = truncated.find('\n')
+            if newline_idx > 0:
+                truncated = truncated[newline_idx + 1:]
+            conversation_history = truncated
+            logger.info(
+                "Conversation history truncated to ~%d tokens",
+                _count_tokens(conversation_history)
+            )
         full_query = "Previous conversation:\n" + conversation_history + "\n\nCurrent question: " + user_query
 
     # ═══════════════════════════════════════════════════════════════════════
-    # PATH 1: Native tool calling (primary)
+    # Native tool calling
     # ═══════════════════════════════════════════════════════════════════════
-    all_tools = build_all_tool_schemas(cached_schema, include_hana=True)
+    all_tools = build_all_tool_schemas(cached_schema, include_hana=True, tenant_id=tenant_id)
+    tool_schema_map = _build_tool_schema_map(cached_schema, include_hana=True)
     system_tc = build_tool_calling_system_prompt(
-        schema_block, entity_list, user_context, rag_status, tone_guidance
+        schema_block, entity_list, user_context, rag_status, tone_guidance,
+        hana_schema_registry=hana_schema_registry,
     )
 
-    logger.info("Planner: Path 1 — native tool calling (system=%d tokens, tools=%d)", _count_tokens(system_tc), len(all_tools))
+    logger.info("Planner: native tool calling (system=%d tokens, tools=%d)", _count_tokens(system_tc), len(all_tools))
+    # Log tool names for debugging
+    tool_names = []
+    for t in all_tools:
+        if isinstance(t, dict):
+            func = t.get("function", {})
+            if func:
+                name = func.get("name")
+                if name:
+                    tool_names.append(name)
+    logger.info("Planner: available tools: %s", ", ".join(tool_names))
 
-    # Planner tier: gemini-3.5-flash (250K TPM, 15 RPM, 500 RPD free tier)
-    # Estimated ~3,500–5,500 tokens per call depending on schema size
-    choice = await asyncio.to_thread(
-        call_llm, system_tc, full_query,
-        tools=all_tools, temperature=0.1, json_mode=False,
-        tier="planner", estimated_tokens=5500
+    estimated = PLANNER_ESTIMATED_TOKENS
+    logger.info("Planner: about to call LLM with %d tools", len(all_tools))
+    choice = await asyncio.wait_for(
+        asyncio.to_thread(
+            call_llm, system_tc, full_query,
+            tools=all_tools, temperature=0.1, json_mode=False,
+            tier="planner", estimated_tokens=estimated
+        ),
+        timeout=_PLANNER_TIMEOUT_SECONDS,
     )
+    logger.info("Planner: LLM call completed. choice is %s", "None" if choice is None else "present")
+    if choice and choice.get("message", {}).get("tool_calls"):
+        tc_list = choice["message"]["tool_calls"]
+        logger.info("Planner: LLM returned %d tool calls: %s", len(tc_list), 
+                    [t.get("function",{}).get("name", "?") for t in tc_list])
+    else:
+        logger.info("Planner: LLM returned no tool calls")
 
     steps = []
     if choice and choice.get("message", {}).get("tool_calls"):
-        steps = extract_steps_from_tool_calls(choice["message"]["tool_calls"])
+        steps = extract_steps_from_tool_calls(choice["message"]["tool_calls"], tool_schema_map=tool_schema_map, tenant_id=tenant_id)
         steps = _normalize_entity_names(steps, cached_schema)
         logger.info("Planner: Tool calling produced %d steps: %s", len(steps), [s["tool"] for s in steps])
 
@@ -1316,25 +999,7 @@ async def build_tool_plan(
         # Infer metadata from query + steps (deterministic, no extra API call)
         metadata = infer_metadata(user_query, steps, tone_context)
 
-        # If the model also provided content with additional metadata, merge it
-        content = choice.get("message", {}).get("content", "")
-        if content:
-            try:
-                parsed = parse_json_from_text(content)
-                if parsed.get("chart"):
-                    metadata["chart"] = parsed["chart"]
-                if parsed.get("rag"):
-                    metadata["rag"] = parsed["rag"]
-                if parsed.get("rag_query"):
-                    metadata["rag_query"] = parsed["rag_query"]
-                if parsed.get("client_side_binning"):
-                    metadata["client_side_binning"] = parsed["client_side_binning"]
-                if parsed.get("action_context"):
-                    metadata["action_context"] = parsed["action_context"]
-                if parsed.get("reasoning"):
-                    metadata["reasoning"] = parsed["reasoning"]
-            except Exception as e:
-                logger.debug("Failed to parse content metadata: %s", e)
+        # Native tool calling provides structured tool_calls; metadata comes from infer_metadata
 
         plan = {
             "steps": steps,
@@ -1348,34 +1013,13 @@ async def build_tool_plan(
             "client_side_binning": metadata.get("client_side_binning"),
         }
 
-        logger.info("Planner: Path 1 SUCCESS — %d steps, chart=%s, rag=%s, binning=%s",
+        logger.info("Planner: SUCCESS — %d steps, chart=%s, rag=%s, binning=%s",
                    len(plan["steps"]),
-                   "yes" if plan["chart"] else "no",
-                   "yes" if plan["rag"] else "no",
-                   "yes" if plan["client_side_binning"] else "no")
+                    "yes" if plan["chart"] else "no",
+                    "yes" if plan["rag"] else "no",
+                    "yes" if plan["client_side_binning"] else "no")
         return plan
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # PATH 2: JSON text parsing (fallback)
-    # ═══════════════════════════════════════════════════════════════════════
-    logger.warning("Planner: Path 1 failed (no tool steps), attempting Path 2 — JSON fallback")
-
-    system_json = build_json_fallback_system_prompt(
-        schema_block, entity_list, user_context, rag_status, tone_guidance
-    )
-
-    choice = await asyncio.to_thread(
-        call_llm, system_json, full_query,
-        tools=None, temperature=0.1, json_mode=False,
-        tier="planner", estimated_tokens=5500
-    )
-
-    plan = _build_plan_from_choice(choice)
-    if plan and plan.get("steps"):
-        plan["steps"] = _normalize_entity_names(plan["steps"], cached_schema)
-    if plan:
-        logger.info("Planner: Path 2 SUCCESS — JSON fallback produced valid plan")
-        return plan
-
-    logger.error("Planner: Both paths failed. Returning empty plan.")
+    # No tool steps produced by the model. Treat as empty plan rather than silently degraded JSON parsing.
+    logger.warning("Planner: native tool calling produced no steps. Returning empty plan.")
     return _empty_plan()

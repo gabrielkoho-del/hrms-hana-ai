@@ -3,8 +3,8 @@ import re
 import logging
 from typing import Dict, Optional, List
 
-from agent.excel_exporter import export_to_excel
-from agent.llm_client import call_llm
+from agent.output.excel_exporter import export_to_excel
+from agent.integrations.llm_client import call_llm
 from agent.dab.dab_response import format_dab_items_context
 
 from agent.summarizer.prompt.registry import PERSONAL_DATA_CATEGORIES, ACTION_CATEGORIES, get_assist_suggestions
@@ -128,6 +128,15 @@ def summarize_results(user_query, tool_results, conversation_history="", chart_c
     for tool_name, tool_output in tool_results.items():
         if tool_name.startswith("__"):
             continue
+
+        if isinstance(tool_output, dict) and "error" in tool_output:
+            error_msg = tool_output["error"]
+            if not isinstance(error_msg, str):
+                error_msg = str(error_msg)
+            context_parts.append(f"[SYSTEM ERROR] {tool_name} failed: {error_msg}")
+            logger.warning("Tool error in summarizer: %s -> %s", tool_name, error_msg[:200])
+            continue
+
         if isinstance(tool_output, dict) and "result" in tool_output:
             raw_data = tool_output["result"]
             tool_args = tool_output.get("args", {})
@@ -143,6 +152,24 @@ def summarize_results(user_query, tool_results, conversation_history="", chart_c
                 continue
         else:
             data = raw_data
+
+        # HANA-style results arrive as list[dict] in tool_output["result"].
+        # DAB-style results arrive as dict with "items"/"value"/"result".
+        if isinstance(data, list):
+            items = [item for item in data if isinstance(item, dict)]
+            count = len(items)
+            has_more = False
+            end_cursor = None
+            if count > 0:
+                total_row_count = max(total_row_count, count)
+                if count > large_result_threshold:
+                    export_data = items
+            item_lines = format_dab_items_context(tool_name, items, tool_args, has_more, end_cursor)
+            context_parts.extend(item_lines)
+            entity = tool_args.get("entity", "").lower()
+            if count == 0 and any(k in entity for k in ("employee", "leave", "salary", "benefit")) and not tool_args.get("function"):
+                has_empty_personal_data = True
+            continue
 
         if not isinstance(data, dict):
             continue
