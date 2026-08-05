@@ -26,7 +26,11 @@ config/.env
 *.env
 
 # External dependency (cloned separately)
-hana-mcp-server/
+# hana-mcp-server/
+hana-mcp-server/node_modules/
+hana-mcp-server/dist/
+hana-mcp-server/build/
+hana-mcp-server/coverage/
 
 # Design assets (per your request)
 workflow_*.png
