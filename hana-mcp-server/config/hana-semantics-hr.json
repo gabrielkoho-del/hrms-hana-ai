@@ -4,7 +4,7 @@
   "description": "Enhanced HANA semantics for Finance (FI/CO) AI agent use cases. Covers G/L, AR/AP, Fixed Assets, CO-OM, Treasury, MM/SD integration, and master data. Includes semantic definitions for key financial metrics such as revenue, expenses, assets, and liabilities. Revenue accounts: 800000 (Domestic), 805000 (Export).",
   "tables": {
     "BKPF": {
-      "description": "Accounting document header (FI). Stores one row per financial posting document with metadata such as company code, fiscal year, posting date, and currency. CRITICAL FOR AGING REPORTS: BUDAT (posting date) is in this table, NOT in BSEG. For AR/AP aging queries, you MUST join BSEG with BKPF on MANDT, BUKRS, BELNR, GJAHR to access BUDAT for age calculations. Never reference BUDAT directly from BSEG.",
+      "description": "Accounting document header (FI). Stores one row per financial posting document with metadata such as company code, fiscal year, posting date, and currency. CRITICAL FOR AGING REPORTS: BUDAT (posting date) is in this table, NOT in BSEG. For AR/AP aging queries, you MUST join BSEG with BKPF on MANDT, BUKRS, BELNR, GJAHR to access BUDAT for age calculations. CORRECT PATTERN: compute aging inline from the joined BKPF alias, e.g., CASE WHEN DAYS_BETWEEN(BKPF_ALIAS.BUDAT, 'YYYY-12-31') <= 30 THEN ... END. Never reference BUDAT directly from BSEG and never compute DAYS_OVERDUE in a separate FROM DUMMY subquery.",
       "columns": {
         "BELNR": {
           "description": "Accounting document number",
@@ -91,7 +91,7 @@
       }
     },
     "BSEG": {
-      "description": "Accounting document segment (FI). Line-item details for each financial posting, split by company code, fiscal year, and document number. IMPORTANT: BUDAT (posting date) is NOT in this table. For date calculations and aging reports, you MUST join with DBADMIN.BKPF on MANDT, BUKRS, BELNR, GJAHR to access BUDAT from the header table. For Accounts Receivable aging, join with BKPF to access BUDAT, use KUNNR for customer, filter KOART='D' and open items via NULL/empty AUGBL. For Accounts Payable aging, use LIFNR instead of KUNNR. Revenue line items are identified by KOART='S' and SHKZG='H'. Open items are identified by NULL or empty AUGBL.",
+      "description": "Accounting document segment (FI). Line-item details for each financial posting, split by company code, fiscal year, and document number. IMPORTANT: BUDAT (posting date) is NOT in this table. For date calculations and aging reports, you MUST join with DBADMIN.BKPF on MANDT, BUKRS, BELNR, GJAHR to access BUDAT from the header table. ANTI-PATTERN: Do NOT calculate days overdue via CROSS JOIN (SELECT DAYS_BETWEEN(BUDAT, ...) FROM DUMMY); BUDAT is not in BSEG, and FROM DUMMY produces a single row, not a per-row value. For Accounts Receivable aging, join with BKPF to access BUDAT, use KUNNR for customer, filter KOART='D' and open items via NULL/empty AUGBL. For Accounts Payable aging, use LIFNR instead of KUNNR. Revenue line items are identified by KOART='S' and SHKZG='H'. Open items are identified by NULL or empty AUGBL.",
       "columns": {
         "BELNR": {
           "description": "Accounting document number"

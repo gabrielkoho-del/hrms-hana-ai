@@ -26,7 +26,8 @@ config/.env
 *.env
 
 # External dependency (cloned separately)
-# hana-mcp-server/
+hana-mcp-server/
+!hana-mcp-server/config/hana-semantics-hr.json
 hana-mcp-server/node_modules/
 hana-mcp-server/dist/
 hana-mcp-server/build/
