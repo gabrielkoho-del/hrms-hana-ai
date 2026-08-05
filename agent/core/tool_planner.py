@@ -15,12 +15,14 @@ import os
 import re
 import time
 import logging
+from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import jsonschema
 import tiktoken
 
 from agent.integrations.llm_client import call_llm
+from agent.integrations.hana_client import normalize_hana_result
 from agent.config import DEFAULT_MAX_ROWS, LARGE_RESULT_THRESHOLD, UNLIMITED_ROWS, PLANNER_ESTIMATED_TOKENS, CONVERSATION_HISTORY_TOKEN_BUDGET
 from agent.core.prompts import (
     build_tone_aware_guidance,
@@ -36,6 +38,243 @@ from agent.output.binning import (
 )
 
 logger = logging.getLogger("hr_agent")
+
+
+def _load_hana_semantic_schema() -> Optional[Dict]:
+    """Load HANA semantic descriptions from hana-semantics-hr.json."""
+    from pathlib import Path
+    env_path = os.getenv("HANA_SEMANTICS_PATH", "")
+    if env_path:
+        semantics_path = Path(env_path)
+        if not semantics_path.is_absolute():
+            semantics_path = Path(__file__).resolve().parent.parent.parent / semantics_path
+    else:
+        semantics_path = Path(__file__).resolve().parent.parent.parent / "hana-mcp-server" / "config" / "hana-semantics-hr.json"
+
+    if not semantics_path.exists():
+        logger.debug("HANA semantics file not found: %s", semantics_path)
+        return None
+
+    try:
+        with open(semantics_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("tables"):
+            return data
+        logger.warning("HANA semantics file missing 'tables' key: %s", semantics_path)
+    except Exception as e:
+        logger.warning("HANA semantics load failed: %s", e)
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TEMPORAL REASONING — Intemporal context resolution for financial queries
+# ═════════════════════════════════════════════════════════════════════════════
+
+_FINANCIAL_METRIC_KEYWORDS = frozenset({
+    "gross profit", "gross margin", "net profit", "net margin", "ebitda",
+    "revenue", "sales", "income", "expense", "cost", "budget", "actual",
+    "balance sheet", "cash flow", "cashflow", "profitability", "margin",
+    "financial", "finance", "fiscal", "accounting", "gl ", "general ledger",
+    "accounts payable", "accounts receivable", "ap ", "ar ", "invoice",
+    "vendor", "customer", "payment", "receipt", "bank", "cash", "asset",
+    "liability", "equity", "depreciation", "amortization", "tax",
+})
+
+_YEAR_PATTERN = re.compile(r"\b(20\d{2}|19\d{2})\b")
+
+
+def _is_financial_metric_query(user_query: str) -> bool:
+    """Heuristic check whether the query is about financial metrics."""
+    q = user_query.lower()
+    return any(kw in q for kw in _FINANCIAL_METRIC_KEYWORDS)
+
+
+def _extract_year_from_query(user_query: str) -> Optional[int]:
+    """Extract explicit year mention from the query, if any."""
+    matches = _YEAR_PATTERN.findall(user_query)
+    if not matches:
+        return None
+    # Prefer the last mentioned year (usually the relevant one)
+    return int(matches[-1])
+
+
+async def _get_available_fiscal_years(tenant_id: str = "default") -> List[int]:
+    """Return available fiscal years from HANA financial tables, sorted descending."""
+    try:
+        from agent.integrations.hana_client import hana_manager
+        client = hana_manager.get_client(tenant_id)
+        years = set()
+        for query in [
+            "SELECT DISTINCT GJAHR FROM DBADMIN.BKPF ORDER BY GJAHR DESC",
+            "SELECT DISTINCT RYEAR FROM DBADMIN.FAGLFLEXT ORDER BY RYEAR DESC",
+            "SELECT DISTINCT RYEAR FROM DBADMIN.GLT0 ORDER BY RYEAR DESC",
+        ]:
+            try:
+                result = client.call_tool("hana_execute_query", {"query": query, "maxRows": 50})
+                normalized = normalize_hana_result(result, "hana_execute_query")
+                if isinstance(normalized, dict) and "result" in normalized:
+                    for row in normalized["result"]:
+                        for value in row.values():
+                            if isinstance(value, (int, str)):
+                                try:
+                                    years.add(int(str(value).strip()))
+                                except (TypeError, ValueError):
+                                    pass
+            except Exception:
+                continue
+        return sorted(years, reverse=True)
+    except Exception:
+        return []
+
+
+def _resolve_temporal_context(user_query: str, available_years: List[int]) -> Dict[str, Any]:
+    """Resolve temporal context for financial queries.
+
+    Returns a dict with:
+      - resolved_year: int or None
+      - is_inferred: bool
+      - note: str
+    """
+    explicit_year = _extract_year_from_query(user_query)
+    if explicit_year is not None:
+        return {
+            "resolved_year": explicit_year,
+            "is_inferred": False,
+            "note": f"Using explicitly requested year {explicit_year}.",
+        }
+
+    current_year = datetime.now().year
+    if not available_years:
+        fallback = current_year - 1 if current_year > 2000 else current_year
+        return {
+            "resolved_year": fallback,
+            "is_inferred": True,
+            "note": f"No available fiscal years detected; defaulting to most recent complete year {fallback}.",
+        }
+
+    if current_year in available_years:
+        # Current year exists; treat it as potentially incomplete.
+        complete_years = [y for y in available_years if y < current_year]
+        if complete_years:
+            resolved = complete_years[0]
+            return {
+                "resolved_year": resolved,
+                "is_inferred": True,
+                "note": f"Current year {current_year} data may be incomplete; defaulting to most recent complete year {resolved}.",
+            }
+        resolved = current_year
+        return {
+            "resolved_year": resolved,
+            "is_inferred": True,
+            "note": f"Only current year {current_year} is available; using it.",
+        }
+
+    resolved = available_years[0]
+    return {
+        "resolved_year": resolved,
+        "is_inferred": True,
+        "note": f"No data for current year {current_year}; defaulting to most recent available year {resolved}.",
+    }
+
+
+def _format_hana_semantics_for_prompt(
+    semantic_schema: Dict,
+    user_query: str = "",
+    registry: Optional[Dict[str, List[str]]] = None,
+    token_budget: int = 4000,
+) -> str:
+    """Format HANA semantic schema for LLM prompt with token budgeting."""
+    if not semantic_schema or "tables" not in semantic_schema:
+        return ""
+
+    tables = semantic_schema.get("tables", {})
+    if not tables:
+        return ""
+
+    available_tables = set()
+    if registry:
+        for schema_name, table_list in registry.items():
+            available_tables.update(str(t).upper() for t in table_list)
+
+    selected = []
+
+    core_tables = {
+        "BSEG", "BKPF", "FAGLFLEXA", "FAGLFLEXT", "SKA1", "SKAT", "GLT0",
+        "T001", "T001W", "CEPC", "CEPCT", "ANLA", "ANEP", "EKKO", "MSEG",
+        "TCURR", "T003T", "T052", "LFA1", "LFB1", "KNA1", "KNB1", "AUFK",
+        "BSID", "BSAD", "BSIK", "BSAK", "SETLEAF", "SETHEADERT",
+    }
+
+    for table_name in sorted(tables.keys()):
+        table_def = tables[table_name]
+        desc = table_def.get("description", "")
+        if not desc:
+            continue
+
+        if table_name.upper() in core_tables and (not available_tables or table_name.upper() in available_tables):
+            selected.append((table_name, table_def))
+
+    if user_query:
+        q_upper = user_query.upper()
+        for table_name, table_def in tables.items():
+            if table_name.upper() in q_upper and (table_name, table_def) not in selected:
+                if not available_tables or table_name.upper() in available_tables:
+                    selected.append((table_name, table_def))
+
+    if not selected:
+        return ""
+
+    lines = ["SAP HANA SEMANTIC SCHEMA — key financial tables and their business meanings:"]
+    for table_name, table_def in selected:
+        desc = table_def.get("description", "")
+        lines.append(f"  {table_name}: {desc}")
+
+        columns = table_def.get("columns", {})
+        col_lines = []
+        for col_name, col_def in columns.items():
+            parts = [col_name]
+            desc = col_def.get("description", "")
+            meaning = col_def.get("meaning", "")
+            note = col_def.get("business_note", "")
+
+            if desc:
+                parts.append(desc)
+            if meaning and meaning != desc:
+                parts.append(f"({meaning})")
+            if note:
+                parts.append(f"[{note}]")
+
+            if len(parts) > 1:
+                col_lines.append(": ".join(parts))
+
+        for col_line in col_lines[:12]:
+            lines.append(f"    - {col_line}")
+        if len(col_lines) > 12:
+            lines.append(f"    - ... and {len(col_lines) - 12} more columns")
+
+    text = "\n".join(lines)
+
+    try:
+        tokens = _count_tokens(text)
+        if tokens > token_budget:
+            while tokens > token_budget and lines:
+                removed = False
+                for i in range(len(lines) - 1, -1, -1):
+                    if lines[i].startswith("    - "):
+                        lines.pop(i)
+                        text = "\n".join(lines)
+                        tokens = _count_tokens(text)
+                        removed = True
+                        break
+                if not removed:
+                    break
+                if not any(l.startswith("    - ") for l in lines):
+                    break
+    except Exception:
+        pass
+
+    return text
+
 
 _PLANNER_TIMEOUT_SECONDS = 30
 
@@ -784,6 +1023,8 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
         explicit_chart_type = "hist"
     elif any(kw in query_lower for kw in ("box plot", "boxplot", "box chart")):
         explicit_chart_type = "box"
+    elif any(kw in query_lower for kw in ("gauge chart", "kpi gauge", "gauge")):
+        explicit_chart_type = "gauge"
     if explicit_chart_type:
         logger.info("Planner: explicit chart type detected from query: %s", explicit_chart_type)
 
@@ -842,6 +1083,10 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
             "y_column": y_col,
             "y_label": y_label,
             "title": title,
+            "gauge_min": 0 if chart_type == "gauge" else None,
+            "gauge_max": 100 if chart_type == "gauge" else None,
+            "gauge_threshold": 70 if chart_type == "gauge" else None,
+            "trend_line": chart_type == "line" and any(kw in query_lower for kw in ("trend line", "trend", "with trend")),
         }
 
     # ── RAG inference ──
@@ -954,9 +1199,18 @@ async def build_tool_plan(
     # ═══════════════════════════════════════════════════════════════════════
     all_tools = build_all_tool_schemas(cached_schema, include_hana=True, tenant_id=tenant_id)
     tool_schema_map = _build_tool_schema_map(cached_schema, include_hana=True)
+
+    hana_semantic_schema = _load_hana_semantic_schema()
+    hana_semantic_block = _format_hana_semantics_for_prompt(
+        hana_semantic_schema,
+        user_query=user_query,
+        registry=hana_schema_registry,
+    )
+
     system_tc = build_tool_calling_system_prompt(
         schema_block, entity_list, user_context, rag_status, tone_guidance,
         hana_schema_registry=hana_schema_registry,
+        hana_semantic_block=hana_semantic_block,
     )
 
     logger.info("Planner: native tool calling (system=%d tokens, tools=%d)", _count_tokens(system_tc), len(all_tools))
@@ -1013,11 +1267,21 @@ async def build_tool_plan(
             "client_side_binning": metadata.get("client_side_binning"),
         }
 
+        # ═══════════════════════════════════════════════════════════════════════
+        # TEMPORAL REASONING — resolve year for financial queries
+        # ═══════════════════════════════════════════════════════════════════════
+        if _is_financial_metric_query(user_query):
+            available_years = await _get_available_fiscal_years(tenant_id)
+            temporal = _resolve_temporal_context(user_query, available_years)
+            if temporal.get("resolved_year") is not None:
+                plan["temporal_context"] = temporal
+                plan["reasoning"] += " " + temporal.get("note", "")
+
         logger.info("Planner: SUCCESS — %d steps, chart=%s, rag=%s, binning=%s",
                    len(plan["steps"]),
-                    "yes" if plan["chart"] else "no",
-                    "yes" if plan["rag"] else "no",
-                    "yes" if plan["client_side_binning"] else "no")
+                   "yes" if plan["chart"] else "no",
+                   "yes" if plan["rag"] else "no",
+                   "yes" if plan["client_side_binning"] else "no")
         return plan
 
     # No tool steps produced by the model. Treat as empty plan rather than silently degraded JSON parsing.

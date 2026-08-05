@@ -26,7 +26,8 @@ logger = logging.getLogger("hr_agent")
 # FINANCE CONFIG — loaded from YAML at startup
 # ═══════════════════════════════════════════════════════════════════════
 
-_FINANCE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "finance_config.yaml")
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_FINANCE_CONFIG_PATH = os.path.join(_BASE_DIR, "config", "finance_config.yaml")
 
 def _load_finance_config() -> Dict:
     """Load finance configuration from YAML file."""
@@ -123,11 +124,30 @@ INTENT_CATEGORY_MAP = {
     "skills_gap": "aggregate_data",
     "payroll_distribution": "aggregate_data",
     "attrition_risk": "aggregate_data",
+    "revenue_analysis": "aggregate_data",
+    # Workforce analytics (aggregate scope, CHART ELIGIBLE)
+    "workforce_productivity": "workforce_analytics",
+    "revenue_per_employee": "workforce_analytics",
+    "absenteeism_rate": "workforce_analytics",
+    "overtime_cost": "workforce_analytics",
     # Finance / GL data (aggregate scope, CHART ELIGIBLE)
     "finance_gl_analysis": "aggregate_data",
     "finance_cost_analysis": "aggregate_data",
     "finance_currency": "aggregate_data",
     "finance_budget": "aggregate_data",
+    "finance_revenue_analysis": "aggregate_data",
+    "finance_profitability": "aggregate_data",
+    "finance_cashflow": "aggregate_data",
+    "finance_balance_sheet": "aggregate_data",
+    "finance_financial_statement": "aggregate_data",
+    "finance_cost_center": "aggregate_data",
+    "finance_payroll_analysis": "aggregate_data",
+    "finance_accounts_payable": "aggregate_data",
+    "finance_accounts_receivable": "aggregate_data",
+    "finance_invoice_analysis": "aggregate_data",
+    "finance_vendor_analysis": "aggregate_data",
+    "finance_budget_variance": "aggregate_data",
+    "finance_forecast": "aggregate_data",
     # Policy / info (no data scope, NEVER chart)
     "policy_question": "policy_info",
     "general_hr": "policy_info",
@@ -144,7 +164,7 @@ PERSONAL_DATA_CATEGORIES = {"personal_data", "emergency", "grievance", "action_r
 ACTION_CATEGORIES = {"action_request", "emergency", "grievance"}
 
 # Chart eligibility rules (Guideline: Privacy First + Context-Aware)
-CHART_ELIGIBLE_CATEGORIES = {"aggregate_data"}
+CHART_ELIGIBLE_CATEGORIES = {"aggregate_data", "workforce_analytics"}
 NEVER_CHART_CATEGORIES = {"personal_data", "emergency", "grievance", "action_request", "greeting"}
 
 # Data scope inference from intent keywords
@@ -153,7 +173,19 @@ AGGREGATE_KEYWORDS = ("count", "average", "avg", "sum", "total", "distribution",
                       "gender", "age", "salary range", "turnover", "attrition", "hiring",
                       "headcount", "budget", "actual", "funnel", "engagement", "skills",
                       "compensation", "compa", "ratio", "payroll", "overtime", "absenteeism",
-                      "time-to-fill", "source", "effectiveness", "utilization")
+                      "time-to-fill", "source", "effectiveness", "utilization",
+                      "revenue per employee", "hr-to-employee ratio", "workforce productivity",
+                      "productivity index", "absenteeism rate", "overtime cost",
+                      "revenue", "revenue analysis", "total revenue", "revenue for",
+                      "profit", "loss", "net income", "cash flow", "cashflow",
+                      "balance sheet", "financial statement", "income statement",
+                      "p&l", "pnl", "profitability", "margin",
+                      "cost center", "cost centre", "controlling", "overhead",
+                      "budget variance", "forecast", "financial forecast",
+                      "invoice", "invoices", "vendor", "vendors", "billing",
+                      "accounts payable", "accounts receivable", "account payable", "account receivable",
+                      "fico", "fi data", "co data", "sap fi", "sap co",
+                      "financial reporting", "finance report", "bank details")
 INDIVIDUAL_KEYWORDS = ("my ", "i ", "me ", "myself", "john", "jane", "who is", "profile of",
                        "salary of", "leave of", "balance of", "entitlement of")
 
@@ -167,17 +199,34 @@ _MULTI_OPTION_KEYWORDS = ("or would you prefer", "or", "instead", "which would y
                            "choose one", "would you like me to", "shall i", "do you want")
 
 # SAP FI/CO tables available in HANA for finance queries
-_HANA_FINANCE_TABLES = {
+_HANA_FINANCE_TABLES: Set[str] = {
     "FAGLFLEXA", "BKPF", "BSEG", "SKA1", "SKAT",
     "CSKS", "CSKT", "T001", "TCURC", "TCURR",
 }
 
 # Finance domain keywords (narrowed to avoid false positives from generic business terms)
 _FINANCE_KEYWORDS = {
-    "gl account", "general ledger", "bank details",
-    "exchange rate", "currency conversion",
+    # GL / accounting
+    "gl account", "general ledger", "bank details", "chart of accounts",
+    "accounting", "account payable", "account receivable", "accounts payable", "accounts receivable",
+    # Revenue / P&L / balance sheet / cash flow
+    "revenue", "sales revenue", "total revenue", "revenue analysis",
+    "profit", "loss", "net income", "operating income", "ebitda",
+    "profitability", "margin", "gross margin", "net margin",
+    "cash flow", "cashflow", "operating cash flow", "free cash flow",
+    "balance sheet", "assets", "liabilities", "equity",
+    "financial statement", "income statement", "p&l", "pnl",
+    # Cost / budget / controlling
+    "cost center", "cost centre", "controlling", "overhead",
+    "budget", "budget variance", "forecast", "financial forecast",
     "salary cost", "compensation cost", "benefits cost",
-    "overhead", "personnel cost", "labor cost", "fte cost",
+    "personnel cost", "labor cost", "fte cost", "headcount cost",
+    # Currency / banking / vendors / invoices
+    "exchange rate", "currency conversion", "forex",
+    "vendor", "vendors", "invoice", "invoices", "billing",
+    # FI/CO references
+    "fico", "fi data", "co data", "sap fi", "sap co",
+    "financial reporting", "finance report",
 }
 
 _FULL_INFO_PATTERNS = [
@@ -231,10 +280,34 @@ def initialize_finance_tables(hana_client: Any = None) -> None:
         _discovered_finance_tables = discovered if discovered else None
         _discovered_tables_timestamp = time.time()
         logger.info("Finance table discovery: found %d finance tables from HANA schema", len(discovered or set()))
+
+        # ── Startup validation: warn on configured tables missing from discovery ──
+        _validate_finance_table_coverage(discovered)
     except Exception as e:
         logger.warning("Finance table discovery failed: %s. Using fallback tables.", e)
         _discovered_finance_tables = None
         _discovered_tables_timestamp = time.time()
+
+
+def _validate_finance_table_coverage(discovered: Set[str]) -> None:
+    """Warn at startup when configured finance tables are absent from the live registry."""
+    if not discovered:
+        return
+    fallback = set(_FINANCE_FALLBACK_TABLES)
+    missing = fallback - discovered
+    if missing:
+        logger.warning(
+            "Finance config references %d tables not found in HANA registry: %s. "
+            "Check config/finance_config.yaml or schema discovery.",
+            len(missing), ", ".join(sorted(missing))
+        )
+    extra = discovered - fallback
+    if extra:
+        logger.info(
+            "Finance discovery found %d tables not in config fallback: %s. "
+            "Consider updating config/finance_config.yaml.",
+            len(extra), ", ".join(sorted(extra))
+        )
 
 
 def _get_finance_tables() -> Set[str]:
@@ -290,8 +363,8 @@ def _conversation_has_multi_option_offer(history: str) -> bool:
 _CLASSIFIER_SYSTEM = """You are an intent classifier for an HR AI assistant. 
 Analyze the user's query and classify it into structured categories.
 
-Return ONLY a JSON object with these exact keys:
- - intent: One of [greeting, smalltalk, leave_request, leave_balance, policy_question, profile_lookup, salary_question, org_hierarchy, emergency, medical, complaint, resignation, benefits_enrollment, profile_update, training_request, general_hr, department_count, gender_distribution, hiring_trend, salary_analysis, turnover_analysis, age_distribution, performance_distribution, leave_analysis, mc_trend, attendance_analysis, recruitment_funnel, compensation_ratio, headcount_budget, diversity_hiring, engagement_scores, skills_gap, payroll_distribution, attrition_risk, finance_gl_analysis, finance_cost_analysis, finance_currency, finance_budget, data_discovery]
+ Return ONLY a JSON object with these exact keys:
+  - intent: One of [greeting, smalltalk, leave_request, leave_balance, policy_question, profile_lookup, salary_question, org_hierarchy, emergency, medical, complaint, resignation, benefits_enrollment, profile_update, training_request, general_hr, department_count, gender_distribution, hiring_trend, salary_analysis, turnover_analysis, age_distribution, performance_distribution, leave_analysis, mc_trend, attendance_analysis, recruitment_funnel, compensation_ratio, headcount_budget, diversity_hiring, engagement_scores, skills_gap, payroll_distribution, attrition_risk, revenue_analysis, workforce_productivity, revenue_per_employee, absenteeism_rate, overtime_cost, finance_gl_analysis, finance_cost_analysis, finance_currency, finance_budget, finance_revenue_analysis, finance_profitability, finance_cashflow, finance_balance_sheet, finance_financial_statement, finance_cost_center, finance_payroll_analysis, finance_accounts_payable, finance_accounts_receivable, finance_invoice_analysis, finance_vendor_analysis, finance_budget_variance, finance_forecast, data_discovery]
 - data_scope: One of [individual, aggregate, none]. "individual" = about a specific person (me, John, my profile). "aggregate" = about groups, departments, trends, distributions. "none" = no data needed (policy, greeting, action steps).
 - chart_eligible: boolean. TRUE only if the query is about aggregate data (group comparisons, distributions, trends, proportions) AND not about a specific person. FALSE for personal lookups, single values, action requests, policy questions, greetings.
 - urgency_level: One of [routine, time_sensitive, urgent, distressed]
@@ -310,8 +383,10 @@ Rules:
 - "high" topic_sensitivity = medical, mental health, family crisis, harassment, termination, resignation
 - "medium" = leave disputes, salary issues, performance concerns, benefits
 - "low" = directory lookups, general policy questions, org chart queries, training info
-- data_scope = "aggregate" when user asks about: counts per department, gender distribution, hiring trends, average salary by level, turnover rate, age distribution, performance ratings, leave analysis, MC trends, headcount, recruitment funnel, engagement scores, skills gap, etc.
-- "How many X are in table Y?", "Count X in Y", or "Total X in Y" where Y is a database table is an AGGREGATE query with intent=aggregate_data or a finance intent like finance_gl_analysis/finance_budget. It is NOT data_discovery.
+  - data_scope = "aggregate" when user asks about: counts per department, gender distribution, hiring trends, average salary by level, turnover rate, age distribution, performance ratings, leave analysis, MC trends, headcount, recruitment funnel, engagement scores, skills gap, total revenue, revenue by period, revenue analysis, etc.
+  - Finance/admin queries such as general ledger, cost center, budget, currency, exchange rate, invoice, vendor, payroll cost, accounts payable/receivable, profitability, cash flow, balance sheet, financial statements, forecast, and FI/CO reporting are aggregate_data queries, NOT data_discovery.
+  - Workforce productivity metrics such as revenue per employee, hr-to-employee ratio, absenteeism rate, and overtime cost are aggregate_data/workforce_analytics queries, NOT data_discovery.
+ - "How many X are in table Y?", "Count X in Y", or "Total X in Y" where Y is a database table is an AGGREGATE query with intent=aggregate_data or a finance intent like finance_gl_analysis/finance_budget. It is NOT data_discovery.
 - Data_discovery is ONLY when the user asks: "what data do you have?", "what's available?", "show me what you can access", "what tables exist?", "what schemas are there?" — questions about system capability, not data retrieval.
 - Questions asking for specific counts, totals, sums, averages, or actual data values from known tables/entities are aggregate_data, not data_discovery.
 - data_scope = "individual" when user asks about: my leave, John's salary, my profile, who is my manager, my balance, my department, my team.
@@ -381,7 +456,9 @@ def classify_intent(user_query: str, conversation_history: str = "",
                 category = "data_discovery"
             elif any(k in intent for k in ("salary", "profile", "leave", "benefit", "medical", "emergency")):
                 category = "personal_data"
-            elif any(k in intent for k in ("org", "department", "team", "count", "aggregate", "distribution", "trend", "analysis", "rate", "funnel", "engagement", "skills", "compensation", "payroll", "attrition", "headcount", "budget", "hiring", "finance", "gl", "cost center", "currency", "exchange", "fx")):
+            elif any(k in intent for k in ("workforce", "productivity", "revenue_per_employee", "absenteeism_rate", "overtime_cost")):
+                category = "workforce_analytics"
+            elif any(k in intent for k in ("finance", "revenue", "budget", "cost", "currency", "exchange", "fx", "gl", "invoice", "vendor", "payroll", "payable", "receivable", "profit", "cashflow", "balance", "forecast", "fico", "controlling")):
                 category = "aggregate_data"
             else:
                 category = "policy_info"

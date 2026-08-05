@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -71,6 +72,79 @@ def hana_columns_rows_to_dicts(
     return out
 
 
+_DESCRIBE_FIELD_PATTERN = re.compile(
+    r"(?im)^(?:column_name|field_name|name)\s*[:=]\s*(.+?)$"
+)
+_DESCRIBE_TYPE_PATTERN = re.compile(
+    r"(?im)^(?:data_type|type|data_type_name)\s*[:=]\s*(.+?)$"
+)
+
+
+def _parse_hana_describe_text(text: str) -> Optional[tuple]:
+    """Parse describe-table text into (columns, rows).
+
+    Handles common HANA describe/explain text layouts including:
+      COLUMN_NAME : ...
+      DATA_TYPE   : ...
+    and tabular / repeating blocks separated by blank lines.
+    """
+    if not text or not text.strip():
+        return None
+
+    columns = ["column_name", "data_type_name", "description"]
+    rows: List[Dict[str, Any]] = []
+    current: Dict[str, str] = {}
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current:
+                rows.append(current)
+                current = {}
+            continue
+
+        col_match = _DESCRIBE_FIELD_PATTERN.match(line)
+        type_match = _DESCRIBE_TYPE_PATTERN.match(line)
+
+        if col_match:
+            if current:
+                rows.append(current)
+                current = {}
+            current["column_name"] = col_match.group(1).strip()
+        elif type_match:
+            current["data_type_name"] = type_match.group(1).strip()
+        elif not current and "," in line:
+            # Heuristic: comma-separated header-like line
+            parts = [p.strip() for p in line.split(",") if p.strip()]
+            if parts:
+                current["column_name"] = parts[0]
+                if len(parts) > 1:
+                    current["data_type_name"] = parts[1]
+        elif not current and line:
+            current["column_name"] = line
+
+    if current:
+        rows.append(current)
+
+    if not rows:
+        return None
+
+    # Normalize empty strings and deduplicate column names while preserving order
+    seen = set()
+    normalized_cols = []
+    for col in columns:
+        if col not in seen:
+            normalized_cols.append(col)
+            seen.add(col)
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                normalized_cols.append(key)
+                seen.add(key)
+
+    return normalized_cols, rows
+
+
 def normalize_hana_result(result: Any, tool_name: str = "") -> Any:
     if not isinstance(result, dict):
         if isinstance(result, list):
@@ -109,6 +183,36 @@ def normalize_hana_result(result: Any, tool_name: str = "") -> Any:
             len(result.get("result", [])),
         )
         return result
+
+    # Best-effort fallback for describe-style tools that return text content.
+    if tool_name in {"hana_describe_table", "hana_explain_table", "hana_get_sample_data"}:
+        content = result.get("content")
+        if isinstance(content, list) and content:
+            texts = []
+            for c in content:
+                if isinstance(c, dict):
+                    text = c.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text.strip())
+            if texts:
+                combined = "\n".join(texts)
+                try:
+                    parsed = _parse_hana_describe_text(combined)
+                    if parsed:
+                        cols, rows = parsed
+                        if rows and isinstance(rows[0], dict):
+                            result["result"] = rows
+                        else:
+                            result["result"] = hana_columns_rows_to_dicts(cols, rows or [])
+                        result["message"] = f"HANA describe returned {len(result['result'])} fields"
+                        logger.info(
+                            "HANA_NORM_RESULT: tool=%s parsed_describe fields=%d",
+                            tool_name,
+                            len(result.get("result", [])),
+                        )
+                        return result
+                except Exception as e:
+                    logger.debug("HANA describe parse failed for %s: %s", tool_name, e)
 
     logger.warning(
         "HANA normalize: no columns/rows in result. keys=%r content_types=%r",
@@ -224,6 +328,53 @@ def validate_hana_tool_args(
             return f"table_name '{table_name}' not found in schema '{schema_name}'. Available tables: {preview}"
 
     return None
+
+
+def _looks_like_numeric_type_error(error_text: str) -> bool:
+    """Heuristic check for HANA errors caused by aggregating a non-numeric column."""
+    if not isinstance(error_text, str):
+        return False
+    lowered = error_text.lower()
+    return any(flag in lowered for flag in [
+        "invalid number",
+        "not a numeric type",
+        "only numeric type is available",
+        "type mismatch",
+        "cannot convert",
+        "invalid numeric",
+        "numeric overflow",
+        "invalid argument for function",
+        "inconsistent datatype",
+    ])
+
+
+def _wrap_aggregate_fields_with_cast(query: str) -> str:
+    """Best-effort SQL sanitizer: wrap aggregate target fields with CAST(... AS DECIMAL).
+
+    This is intentionally conservative: it only rewrites known aggregate patterns,
+    and only when the query does not already contain an explicit CAST.
+    """
+    if not isinstance(query, str):
+        return query
+    if "cast(" in query.lower():
+        return query
+
+    import re
+    pattern = re.compile(r"\b(SUM|AVG|MIN|MAX)\(([^)]+)\)", re.IGNORECASE)
+    replacements: List[str] = []
+
+    def _replacer(match: re.Match) -> str:
+        func = match.group(1)
+        field = match.group(2).strip()
+        if any(ch.isalpha() for ch in field):
+            replacements.append(f"{func}(CAST({field} AS DECIMAL))")
+            return f"{func}(CAST({field} AS DECIMAL))"
+        return match.group(0)
+
+    new_query = pattern.sub(_replacer, query)
+    if replacements:
+        logger.info("HANA_SQL_CAST: rewrote aggregate targets: %s", replacements)
+    return new_query
 
 
 

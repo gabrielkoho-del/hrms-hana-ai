@@ -29,6 +29,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 
 from agent.dab.dab_response import extract_items
 
@@ -43,6 +44,9 @@ CHART_BASE_URL = os.getenv("CHART_BASE_URL", os.getenv("AGENT_BASE_URL", "http:/
 CHART_MAX_CATEGORIES = int(os.getenv("CHART_MAX_CATEGORIES", "20"))
 CHART_DPI = int(os.getenv("CHART_DPI", "150"))
 CHART_PIE_MAX_SLICES = int(os.getenv("CHART_PIE_MAX_SLICES", "8"))
+CHART_GAUGE_MIN = int(os.getenv("CHART_GAUGE_MIN", "0"))
+CHART_GAUGE_MAX = int(os.getenv("CHART_GAUGE_MAX", "100"))
+CHART_GAUGE_THRESHOLD = int(os.getenv("CHART_GAUGE_THRESHOLD", "70"))
 
 os.makedirs(CHART_OUTPUT_DIR, exist_ok=True)
 
@@ -466,6 +470,92 @@ def _composite_x_labels(df: pd.DataFrame, x_col: str, series_col: Optional[str])
     return result
 
 
+def _add_trend_line(ax, df: pd.DataFrame, x_col: str, y_col: str) -> None:
+    """Add a simple linear trend line to a line chart."""
+    try:
+        import numpy as np
+    except ImportError:
+        logger.warning("CHART_TREND_LINE: numpy is not available; skipping trend line.")
+        return
+    if df.empty or y_col not in df.columns:
+        return
+    clean = df[[x_col, y_col]].dropna()
+    if clean.empty:
+        return
+    x = np.arange(len(clean))
+    y = clean[y_col].to_numpy()
+    if len(x) < 2:
+        return
+    coeffs = np.polyfit(x, y, 1)
+    trend = coeffs[0] * x + coeffs[1]
+    ax.plot(clean[x_col].to_numpy(), trend, linestyle="--", color=COLORBLIND_PALETTE[-1], linewidth=1.5, label="Trend")
+    ax.legend()
+
+
+def _render_gauge_chart(
+    ax,
+    data: List[Dict],
+    y_col: Optional[str],
+    title: Optional[str],
+    gauge_min: float,
+    gauge_max: float,
+    gauge_threshold: float,
+) -> None:
+    """Render a simple matplotlib gauge chart for a single KPI value."""
+    value = None
+    if data and isinstance(data[0], dict):
+        raw = data[0].get(y_col) if y_col and y_col in data[0] else next(iter(data[0].values()), None)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = None
+    if value is None:
+        logger.warning("CHART_GAUGE: unable to derive numeric value from data=%s", data[:1])
+        ax.set_title(title or "Gauge")
+        ax.text(0.5, 0.5, "No numeric value available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        return
+
+    value = max(gauge_min, min(gauge_max, value))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(title or "KPI Gauge", fontsize=14, fontweight="bold")
+
+    theta = np.linspace(np.pi, 0, 100)
+    r = 5
+    x = r * np.cos(theta) + 5
+    y = r * np.sin(theta) + 5
+    ax.plot(x, y, color="black", linewidth=2)
+
+    arc_theta = np.linspace(np.pi, 0, 100)
+    ratio = max(0.0, min(1.0, (value - gauge_min) / max(gauge_max - gauge_min, 1e-9)))
+    split = int(ratio * len(arc_theta))
+    if gauge_threshold >= gauge_min:
+        threshold_ratio = (gauge_threshold - gauge_min) / max(gauge_max - gauge_min, 1e-9)
+        threshold_ratio = max(0.0, min(1.0, threshold_ratio))
+        threshold_idx = int(threshold_ratio * len(arc_theta))
+        ax.plot(x[:threshold_idx], y[:threshold_idx], color="#DC267F", linewidth=12, solid_capstyle="butt")
+        ax.plot(x[threshold_idx:split], y[threshold_idx:split], color="#785EF0", linewidth=12, solid_capstyle="butt")
+        ax.plot(x[split:], y[split:], color="#FE6100", linewidth=12, solid_capstyle="butt")
+    else:
+        ax.plot(x[:split], y[:split], color="#785EF0", linewidth=12, solid_capstyle="butt")
+        ax.plot(x[split:], y[split:], color="#FE6100", linewidth=12, solid_capstyle="butt")
+
+    angle = np.pi * (1 - ratio)
+    needle_x = [5, 5 + 4 * np.cos(angle)]
+    needle_y = [5, 5 + 4 * np.sin(angle)]
+    ax.plot(needle_x, needle_y, color="black", linewidth=2)
+    ax.plot(5, 5, "o", color="black", markersize=6)
+
+    ax.text(5, 1.2, f"{value:g}", ha="center", va="center", fontsize=16, fontweight="bold")
+    ax.text(5, 0.4, f"Range: {gauge_min:g} - {gauge_max:g}", ha="center", va="center", fontsize=9)
+    if gauge_threshold >= gauge_min:
+        ax.text(5, 0.0, f"Threshold: {gauge_threshold:g}", ha="center", va="center", fontsize=9)
+
+
 def generate_matplotlib_chart(
     data: List[Dict],
     chart_type: str,
@@ -474,7 +564,11 @@ def generate_matplotlib_chart(
     title: Optional[str] = None,
     y_label: Optional[str] = None,
     return_mode: Literal["url", "base64", "path"] = "url",
-    include_table: bool = True
+    include_table: bool = True,
+    gauge_min: Optional[float] = None,
+    gauge_max: Optional[float] = None,
+    gauge_threshold: Optional[float] = None,
+    trend_line: bool = False,
 ) -> str:
     """
     Generate matplotlib chart and return URL, base64 data URI, or file path.
@@ -656,7 +750,7 @@ def generate_matplotlib_chart(
                         medians = df.groupby(x_col_for_box)[y_col].median().sort_values(ascending=False)
                         top_groups = medians.head(CHART_MAX_CATEGORIES).index.tolist()
                         groups = groups[top_groups]
-                    ax.boxplot(groups.values, labels=groups.index)
+                    ax.boxplot(groups.values(), labels=groups.index)
                     ax.set_xlabel(x_col.replace("_", " ").title() if not series_col else "Category")
                     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
                 else:
@@ -667,6 +761,26 @@ def generate_matplotlib_chart(
                 logger.warning("Box plot requires a numeric y_column")
                 plt.close(fig)
                 return ""
+
+        elif chart_type == "gauge":
+            _render_gauge_chart(
+                ax=ax,
+                data=data,
+                y_col=y_col,
+                title=title,
+                gauge_min=gauge_min or CHART_GAUGE_MIN,
+                gauge_max=gauge_max or CHART_GAUGE_MAX,
+                gauge_threshold=gauge_threshold or CHART_GAUGE_THRESHOLD,
+            )
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha="center")
+
+        else:
+            logger.warning("Unknown chart type: %s", chart_type)
+            plt.close(fig)
+            return ""
+
+        if trend_line and chart_type == "line" and x_col and y_col and y_col in df.columns:
+            _add_trend_line(ax, df, x_col, y_col)
 
         else:
             logger.warning("Unknown chart type: %s", chart_type)
@@ -722,7 +836,11 @@ def generate_chart(
     y_label: Optional[str] = None,
     mode: Optional[str] = None,
     auth_role: Optional[str] = None,
-    include_table: bool = True
+    include_table: bool = True,
+    gauge_min: Optional[float] = None,
+    gauge_max: Optional[float] = None,
+    gauge_threshold: Optional[float] = None,
+    trend_line: bool = False,
 ) -> str:
     """
     Generate a chart in the configured mode.
@@ -765,12 +883,15 @@ def generate_chart(
         logger.warning("Chart type '%s' not supported in mermaid mode, switching to matplotlib", chart_type)
         mode = "matplotlib"
 
+    if chart_type == "gauge":
+        mode = "matplotlib"
+
     if mode == "mermaid":
         result = generate_mermaid_chart(data, chart_type, x_column, y_column, title, y_label=y_label, include_table=include_table)
     elif mode == "base64":
-        result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="base64", include_table=include_table)
+        result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="base64", include_table=include_table, gauge_min=gauge_min, gauge_max=gauge_max, gauge_threshold=gauge_threshold, trend_line=trend_line)
     else:
-        result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="url", include_table=include_table)
+        result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="url", include_table=include_table, gauge_min=gauge_min, gauge_max=gauge_max, gauge_threshold=gauge_threshold, trend_line=trend_line)
 
     logger.info("CHART_DEBUG_GENERATE: result_len=%d empty=%s", len(result), result == "")
     return result

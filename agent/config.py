@@ -36,3 +36,17 @@ AUTH_MODE = os.getenv("AUTH_MODE", "test")  # "test", "production", "disabled"
 PLANNER_TIER = os.getenv("PLANNER_TIER", "gemini-2.5-flash")
 PLANNER_ESTIMATED_TOKENS = int(os.getenv("PLANNER_ESTIMATED_TOKENS", "5500"))
 CONVERSATION_HISTORY_TOKEN_BUDGET = int(os.getenv("CONVERSATION_HISTORY_TOKEN_BUDGET", "2000"))
+
+# ==============================
+# SCHEMA REGISTRY
+# ==============================
+SCHEMA_REGISTRY_TTL_SECONDS = int(os.getenv("SCHEMA_REGISTRY_TTL_SECONDS", "3600"))
+SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS = int(os.getenv("SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS", "3600"))
+
+# ==============================
+# RAG / CHROMADB
+# ==============================
+CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "hr_policies")
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.20"))

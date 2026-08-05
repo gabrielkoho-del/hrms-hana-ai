@@ -45,7 +45,7 @@ from agent.dab.metrics import (
     record_chart_generated
 )
 from agent.dab.odata_normalizer import normalize_odata_args
-from agent.integrations.hana_client import hana_manager, normalize_hana_result, extract_hana_items, validate_hana_tool_args
+from agent.integrations.hana_client import hana_manager, normalize_hana_result, extract_hana_items, validate_hana_tool_args, _looks_like_numeric_type_error, _wrap_aggregate_fields_with_cast
 from agent.integrations.schema_registry import schema_registry_service
 
 logger = logging.getLogger("hr_agent")
@@ -620,6 +620,37 @@ async def _execute_dab_tool_call(step: Dict, state: Dict, auth_context: Any, ten
 # HANA TOOL EXECUTION
 # ═════════════════════════════════════════════════════════════════════════════
 
+async def _try_numeric_cast_retry(tool: str, args: Dict[str, Any], state: Dict, call_id: str, error_text: str, client: Any) -> bool:
+    """Retry hana_execute_query with CAST(... AS DECIMAL) after a numeric-type error.
+
+    Returns True if retry succeeded, False otherwise.
+    """
+    if not _looks_like_numeric_type_error(error_text):
+        return False
+    if tool != "hana_execute_query":
+        return False
+    if not isinstance(args, dict) or not isinstance(args.get("query"), str):
+        return False
+
+    sanitized_query = _wrap_aggregate_fields_with_cast(args["query"])
+    if sanitized_query == args["query"]:
+        return False
+
+    retry_args = dict(args)
+    retry_args["query"] = sanitized_query
+    try:
+        raw = client.call_tool(tool, retry_args)
+        normalized = normalize_hana_result(raw, tool)
+        if isinstance(normalized, dict) and "result" in normalized and normalized.get("result"):
+            state["tool_results"][call_id] = normalized
+            state["tool_calls_made"].append({"tool": tool, "args": retry_args, "status": "SUCCESS_AFTER_CAST"})
+            logger.info("HANA tool %s succeeded after numeric cast retry (call_id=%s)", tool, call_id)
+            return True
+    except Exception as retry_e:
+        logger.error("HANA tool %s retry after cast failed: %s", tool, retry_e)
+    return False
+
+
 async def _execute_hana_tool_call(step: Dict, state: Dict, auth_context: Any, tenant_id: str = "LOCALDEV", cached_schema: Dict = None, cached_tools: List[Dict] = None):
     tool = step.get("tool", "")
     args = step.get("args", {})
@@ -683,12 +714,15 @@ async def _execute_hana_tool_call(step: Dict, state: Dict, auth_context: Any, te
             state["tool_results"][call_id] = {"error": error_msg}
             state["tool_calls_made"].append({"tool": tool, "args": args, "status": f"ERROR: {error_msg}"})
             logger.error("HANA tool %s error: %s | raw=%s", tool, error_msg, {k: v for k, v in normalized.items() if k != "result"})
+            if not await _try_numeric_cast_retry(tool, args, state, call_id, error_msg, client):
+                pass  # Error already recorded above
         else:
             state["tool_results"][call_id] = normalized
             state["tool_calls_made"].append({"tool": tool, "args": args, "status": "SUCCESS"})
             logger.info("HANA tool %s succeeded (call_id=%s)", tool, call_id)
-
     except Exception as e:
-        logger.error("HANA tool %s failed: %s", tool, e)
-        state["tool_results"][call_id] = {"error": str(e)}
-        state["tool_calls_made"].append({"tool": tool, "args": args, "status": f"ERROR: {e}"})
+        error_text = str(e)
+        logger.error("HANA tool %s failed: %s", tool, error_text)
+        state["tool_results"][call_id] = {"error": error_text}
+        state["tool_calls_made"].append({"tool": tool, "args": args, "status": f"ERROR: {error_text}"})
+        await _try_numeric_cast_retry(tool, args, state, call_id, error_text, client)

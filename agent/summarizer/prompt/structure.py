@@ -52,6 +52,16 @@ def build_response_structure(category: str, has_data: bool, has_empty_result: bo
             "Keep it brief and relevant."
         )
 
+    # Workforce analytics override
+    if category == "workforce_analytics":
+        parts.append(
+            "STAGE 1 - INFORM: Present the KPI result clearly. "
+            "When multiple KPIs are available, use a markdown table with headers: KPI | Current Value | Target | Status. "
+            "Bold the KPI names. Use clear status wording such as On Track, At Risk, or Off Track. "
+            "If a KPI cannot be calculated from available data, say 'N/A - requires [data source]'. "
+            "Then add a short 'Why it matters' line explaining the business impact."
+        )
+
     # STAGE 3: OFFER FEEDBACK
     # If user response is ambiguous, override Stage 3 to force clarification
     if tone_context.get("is_ambiguous"):

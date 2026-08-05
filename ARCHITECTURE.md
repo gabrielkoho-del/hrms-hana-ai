@@ -1,8 +1,8 @@
 # HR AI Agent + DAB Data Layer — Architecture Document
 
-> **Generated from live codebase analysis**  
-> **Workspace:** `C:\Users\USER\Documents\hrms-hana-ai`  
-> **Last updated:** 2026-07-29 (Manual update based on code review)
+> **Generated from live codebase analysis**
+> **Workspace:** `C:\Users\USER\Documents\hrms-hana-ai`
+> **Last updated:** 2026-08-04 (Updated based on code review)
 
 ---
 
@@ -24,13 +24,15 @@ This is a **multi-tenant, permission-aware, reflexive HR AI Agent** built on Fas
 | **Production observability** | OpenTelemetry metrics with graceful null fallback |
 | **Zero-touch code resolution** | Per-tenant codesetup reverse index for LLM context |
 | **Session state management** | Follow-up action caching (DST-lite) |
-| **Dynamic finance table discovery** | SAP HANA schema scanning at startup |
+| **Dynamic finance table discovery** | SAP HANA schema scanning at startup with background refresh |
 | **Config-driven finance intent detection** | YAML-configured keywords and table patterns |
 
 ### Design Philosophy
 
-> **1st priority: Production practice** — layered defense, declarative config, telemetry, strict validation, deterministic fallbacks.  
-> **2nd priority: DRY consolidation** — shared utilities (`agent/dab/`), config-driven registries, no duplicated logic.  
+> **1st priority: Production practice** — layered defense, declarative config, telemetry, strict validation, deterministic fallbacks.
+> 
+> **2nd priority: DRY consolidation** — shared utilities (`agent/dab/`), config-driven registries, no duplicated logic.
+> 
 > **3rd priority: Agentic / non-hardcoding** — LLM-driven reasoning, dynamic planning, self-healing.
 
 ---
@@ -196,7 +198,40 @@ Finance intent keywords are loaded from `config/finance_config.yaml` at import t
 
 ---
 
-### 3.3 Reflexive Agent Pipeline (`agent/agentic_executor.py`)
+### 3.3 Schema Registry Service (`agent/integrations/schema_registry.py`)
+
+**Per-tenant HANA schema registry service** that replaces ad-hoc file I/O in agentic_executor with a single startup-loaded, in-memory registry that mirrors the production architecture while using local JSON cache files instead of Redis.
+
+#### Key Features
+
+- **In-memory per-tenant registry**: Loads all discovered tenant registries at startup and serves them from memory during request execution
+- **TTL-based reload**: `get_registry()` reloads a tenant when its in-memory cache is older than `ttl_seconds`
+- **Background refresh**: `start_background_refresh()` launches an asyncio task that periodically diffs the live HANA registry against the cached one and reloads on mismatch
+- **JSON cache fallback**: Uses local JSON cache files instead of Redis for persistence
+- **Schema enrichment**: Optionally enriches schema with business semantics via `hana_explain_table`
+
+#### Usage
+
+```python
+from agent.integrations.schema_registry import schema_registry_service
+
+# Get registry for a tenant (with automatic TTL-based reload)
+schemas = schema_registry_service.get_registry(tenant_id)
+
+# Get enriched schema metadata
+enriched = schema_registry_service.get_enriched_schema(tenant_id)
+
+# Start background refresh (typically called in FastAPI lifespan)
+await schema_registry_service.start_background_refresh(
+    tenant_ids=["RDEMOROCKFORT", "LOCALDEV"],
+    hana_manager=hana_manager,
+    refresh_interval_seconds=3600
+)
+```
+
+---
+
+### 3.4 Reflexive Agent Pipeline (`agent/agentic_executor.py`)
 
 The core execution engine. Four stages:
 
@@ -318,7 +353,7 @@ Prompt blocks:
 
 ---
 
-### 3.4 RAG System (`agent/rag_retriever.py`, `ingestion/`)
+### 3.5 RAG System (`agent/rag_retriever.py`, `ingestion/`)
 
 #### Architecture
 
@@ -351,7 +386,7 @@ PyMuPDF (fitz) → LlamaIndex Document → SentenceSplitter (1200 chars, 150 ove
 
 ---
 
-### 3.5 Semantic Schema Index (`agent/schema_index.py`)
+### 3.6 Semantic Schema Index (`agent/schema_index.py`)
 
 **Lightweight in-memory embedding index** for semantic field retrieval. No external vector DB needed — pure Python + NumPy for <500 fields.
 
@@ -374,7 +409,7 @@ fields = await search_relevant_fields(user_query, cached_schema, tenant_id, top_
 
 ---
 
-### 3.6 Code Resolver (`agent/code_resolver.py`)
+### 3.7 Code Resolver (`agent/code_resolver.py`)
 
 **Zero-touch code resolution** for multi-tenant DAB production. Fetches `codesetup` from each tenant's DAB and builds a reverse index for LLM context injection.
 
@@ -396,7 +431,7 @@ code_context_md = await scan_for_codes(tool_results, tenant_id)
 
 ---
 
-### 3.7 Shared DAB Utilities (`agent/dab/`)
+### 3.8 Shared DAB Utilities (`agent/dab/`)
 
 DRY-consolidated cross-cutting concerns for DAB/MCP operations.
 
@@ -433,7 +468,7 @@ Normalizes entity names, field names, and numeric types before DAB execution. Sc
 
 ---
 
-### 3.8 Auth System (`agent/auth/`)
+### 3.9 Auth System (`agent/auth/`)
 
 #### JWT Validation (`auth/models.py`)
 
@@ -489,9 +524,10 @@ Two-layer defense:
 
 ---
 
-### 3.9 Visualization & Export
+### 3.10 Visualization & Export
 
 #### Excel Exporter (`agent/excel_exporter.py`)
+
 - pandas + openpyxl
 - **Chart-rich export**: 5 worksheets (Executive Summary, Distribution Table, Chart, Raw Data, Metadata)
 - Auto-generated when result rows > `LARGE_RESULT_THRESHOLD` (default 20) or user explicitly requests export
@@ -499,6 +535,7 @@ Two-layer defense:
 - Auto-cleanup after 24 hours
 
 #### Chart Generator (`agent/chart_generator.py`)
+
 - matplotlib (Agg backend) + pandas + Mermaid syntax
 - Types: `bar`, `barh`, `pie`, `hist`, `line`, `box`
 - **Environment-driven output modes**:
@@ -751,6 +788,7 @@ This prevents the AI from hallucinating leave balances based on policy text. If 
 | `CodeResolver` | Per-tenant | On first use | 5 min |
 | `Session state` | Per-user | Every turn | In-memory only |
 | **Finance tables** | **Global** | **Startup (`initialize_finance_tables`)** | **1 hr (configurable)** |
+| **HANA Schema Registry** | **Per-tenant** | **Startup + background refresh** | **Configurable (default 1 hr)** |
 
 ---
 
@@ -838,6 +876,8 @@ Used for auto-discovery and schema caching.
 | `OTEL_SERVICE_NAME` | `hr-ai-agent` | OpenTelemetry service name |
 | `DAB_DISCOVERY_TENANT` | `RDEMOROCKFORT` | Default tenant for tool discovery |
 | `FINANCE_TABLE_CACHE_TTL` | `3600` | Finance table discovery cache TTL (seconds) |
+| `SCHEMA_REGISTRY_TTL_SECONDS` | `3600` | HANA schema registry TTL (seconds) |
+| `SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS` | `3600` | HANA schema registry background refresh interval (seconds) |
 
 ---
 
@@ -893,7 +933,7 @@ hrms-hana-ai/
 │   │   ├── llm_client.py         # Unified LLM client (Gemini primary)
 │   │   ├── rag_retriever.py      # ChromaDB + Gemini retriever
 │   │   ├── schema_index.py       # In-memory semantic field index
-│   │   ├── schema_registry.py    # HANA schema registry
+│   │   ├── schema_registry.py    # **NEW: Per-tenant HANA schema registry service**
 │   │   └── __init__.py
 │   │
 │   ├── output/               # Visualization & export
@@ -946,8 +986,7 @@ hrms-hana-ai/
 │   │   ├── dab-config.Production.json
 │   │   ├── dab-config.Rymnet.json
 │   │   ├── dab-config.Rymnet.test.json
-│   │   ├── finance_config.yaml   # (NEW) 
-│   │                                │   discovery + intent keyword configuration
+│   │   ├── finance_config.yaml   # **(NEW) Finance table discovery + intent keyword configuration**
 │   │   ├── suggestions.yaml
 │   │   └── tenant_mappings.yaml  # Multi-tenant RBAC + DAB URL routing
 │   │
@@ -973,51 +1012,54 @@ hrms-hana-ai/
 │   ├── requirements.txt          # Python dependencies
 │   └── package.json              # Node.js dependencies (for hana-mcp-server)
 │   
-│   ---
-│   
-│   ## 10. Current State Assessment
-│   
-│   ### What's Working Well
-│   
-│   - ✅ Multi-tenant RBAC with permission-aware tool filtering
-│   - ✅ OpenAI-compatible API with streaming support
-│   - ✅ **Gemini 3.1 Flash Lite as primary LLM** (1M context, 64K output)
-│   - ✅ DAB-based data abstraction for HR data (replaces custom MCP server)
-│   - ✅ **Config-driven finance keywords** — loaded from `config/finance_config.yaml`, not hardcoded in source
-│   - ✅ **SAP HANA integration** via HTTP-first MCP client with result normalization (`hana_client.py`)
-│   - ✅ Registry-driven executor (`_TOOL_REGISTRY`) — idiomatic replacement for prefix string-matching
-│   - ✅ Unified execution contract — DAB and HANA results share `state["tool_results"]` shape
-│   - ✅ RAG with free Gemini embeddings and conservative rate limiting
-│   - ✅ Tone-aware responses (empathy for distressed users)
-│   - ✅ Source-of-truth discipline (DB over policy text for personal data)
-│   - ✅ Excel export + chart generation for large results
-│   - ✅ DAB OData filter validation (read-only by design)
-│   - ✅ Caching of tools, schema, distinct values, and schema index at startup
-│   - ✅ DRY consolidation: `agent/dab/` centralizes response extraction, metrics, validation, normalization
-│   - ✅ Semantic schema index for field discovery without external vector DB
-│   - ✅ OpenTelemetry metrics with graceful null fallback
-│   - ✅ 3-stage response structure (Inform → Assist → Offer feedback)
-│   - ✅ Client-side dynamic binning for multi-tenant schemas
-│   - ✅ Chart artifact injection into LLM context (industry standard)
-│   - ✅ **Session state management** for follow-up actions (export, drill-down)
-│   - ✅ **Code resolver** for zero-touch multi-tenant code translation
-│   - ✅ **Ambiguous response handling** prevents guessing on "yes"/"ok"
-│   - ✅ **Finance intent detection** — config-driven keywords + dynamic HANA schema discovery at startup
-│   - ✅ **Finance table discovery** — queries `hana_list_tables` at startup, caches with TTL, falls back to YAML config
-│   - ✅ **Finance keyword narrowing** — removed broad terms (`company code`, `fiscal year`, `payroll`, `depreciation`) that caused false positives
-│   - ✅ **Monolithic refactoring** — extracted `agent/prompts.py`, `agent/binning.py`, `agent/session_state.py` from `tool_planner.py` and `agentic_executor.py`
-│   - ✅ **Finance intent consolidation** — removed duplicate `_HANA_FINANCE_TABLES` and `_FINANCE_KEYWORDS` from executor, consolidated into intent_classifier.py
-│   
-│   ### Areas for Improvement
-│   
-│   - ⚠️ No retry logic for DAB server startup (if DB is down at startup, `discover_tools` fails silently)
-│   - ⚠️ `GeminiRateLimiter` and `GeminiGenAIEmbedder` have duplicated rate limiting logic — could be unified into `agent/dab/`
-│   - ⚠️ `tenant_mappings.yaml` `default_role: null` means no access for unmapped groups — consider a read-only fallback
-│   - ⚠️ `CHART_OUTPUT_DIR` default `/mnt/agents/output` was changed to `./agent/output` — verify in all environments
-│   - ⚠️ Session state is in-memory only — not persisted across restarts
-│   - ⚠️ Code resolver uses cursor-based pagination but `page_size` variable is referenced before assignment in `_extract_items`
-│   - ⚠️ Schema token budget (`TOKEN_BUDGET = 1500`) is conservative for Gemini 3.1 Flash Lite's 1M context; consider raising to 4,000–6,000 tokens to reduce over-pruning
-│   
-│   ---
-│   
-│   *End of Architecture Document*
+├── ---
+│
+├── ## 10. Current State Assessment
+│
+├── ### What's Working Well
+│
+├── - ✅ Multi-tenant RBAC with permission-aware tool filtering
+├── - ✅ OpenAI-compatible API with streaming support
+├── - ✅ **Gemini 3.1 Flash Lite as primary LLM** (1M context, 64K output)
+├── - ✅ DAB-based data abstraction for HR data (replaces custom MCP server)
+├── - ✅ **Config-driven finance keywords** — loaded from `config/finance_config.yaml`, not hardcoded in source
+├── - ✅ **SAP HANA integration** via HTTP-first MCP client with result normalization (`hana_client.py`)
+├── - ✅ Registry-driven executor (`_TOOL_REGISTRY`) — idiomatic replacement for prefix string-matching
+├── - ✅ Unified execution contract — DAB and HANA results share `state["tool_results"]` shape
+├── - ✅ RAG with free Gemini embeddings and conservative rate limiting
+├── - ✅ Tone-aware responses (empathy for distressed users)
+├── - ✅ Source-of-truth discipline (DB over policy text for personal data)
+├── - ✅ Excel export + chart generation for large results
+├── - ✅ DAB OData filter validation (read-only by design)
+├── - ✅ Caching of tools, schema, distinct values, and schema index at startup
+├── - ✅ DRY consolidation: `agent/dab/` centralizes response extraction, metrics, validation, normalization
+├── - ✅ Semantic schema index for field discovery without external vector DB
+├── - ✅ OpenTelemetry metrics with graceful null fallback
+├── - ✅ 3-stage response structure (Inform → Assist → Offer feedback)
+├── - ✅ Client-side dynamic binning for multi-tenant schemas
+├── - ✅ Chart artifact injection into LLM context (industry standard)
+├── - ✅ **Session state management** for follow-up actions (export, drill-down)
+├── - ✅ **Code resolver** for zero-touch multi-tenant code translation
+├── - ✅ **Ambiguous response handling** prevents guessing on "yes"/"ok"
+├── - ✅ **Finance intent detection** — config-driven keywords + dynamic HANA schema discovery at startup
+├── - ✅ **Finance table discovery** — queries `hana_list_tables` at startup, caches with TTL, falls back to YAML config
+├── - ✅ **Finance keyword narrowing** — removed broad terms (`company code`, `fiscal year`, `payroll`, `depreciation`) that caused false positives
+├── - ✅ **Monolithic refactoring** — extracted `agent/prompts.py`, `agent/binning.py`, `agent/session_state.py` from `tool_planner.py` and `agentic_executor.py`
+├── - ✅ **Finance intent consolidation** — removed duplicate `_HANA_FINANCE_TABLES` and `_FINANCE_KEYWORDS` from executor, consolidated into intent_classifier.py
+├── - ✅ **Schema Registry Service** — replaces ad-hoc file I/O with startup-loaded in-memory registry and background refresh
+├── - ✅ **Background schema refresh** — periodically updates HANA schema cache without downtime
+│
+├── ### Areas for Improvement
+│
+├── - ⚠️ No retry logic for DAB server startup (if DB is down at startup, `discover_tools` fails silently)
+├── - ⚠️ `GeminiRateLimiter` and `GeminiGenAIEmbedder` have duplicated rate limiting logic — could be unified into `agent/dab/`
+├── - ⚠️ `tenant_mappings.yaml` `default_role: null` means no access for unmapped groups — consider a read-only fallback
+├── - ⚠️ `CHART_OUTPUT_DIR` default `/mnt/agents/output` was changed to `./agent/output` — verify in all environments
+├── - ⚠️ Session state is in-memory only — not persisted across restarts
+├── - ⚠️ Code resolver uses cursor-based pagination but `page_size` variable is referenced before assignment in `_extract_items`
+├── - ⚠️ Schema token budget (`TOKEN_BUDGET = 1500`) is conservative for Gemini 3.1 Flash Lite's 1M context; consider raising to 4,000–6,000 tokens to reduce over-pruning
+├── - ⚠️ **Background schema refresh task needs better error handling and logging**
+│
+├── ---
+│
+├── *End of Architecture Document*

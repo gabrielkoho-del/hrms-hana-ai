@@ -9,6 +9,7 @@ architecture while using local JSON cache files instead of Redis.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -23,19 +24,52 @@ class SchemaRegistryService:
     Loads all discovered tenant registries at startup and serves them
     from memory during request execution. No file I/O occurs on the
     hot path.
+
+    Renewal policy:
+      - TTL-based reload: ``get_registry()`` reloads a tenant when its
+        in-memory cache is older than ``ttl_seconds``.
+      - Background refresh: ``start_background_refresh()`` launches an
+        ``asyncio`` task that periodically diffs the live HANA registry
+        against the cached one and reloads on mismatch.
     """
 
-    def __init__(self, cache_dir: Optional[str] = None) -> None:
+    def __init__(self, cache_dir: Optional[str] = None, ttl_seconds: Optional[int] = None) -> None:
         self._cache_dir = Path(cache_dir or "data/hana_schema_cache")
+        self._ttl_seconds = ttl_seconds if ttl_seconds is not None else int(
+            __import__("os").getenv("SCHEMA_REGISTRY_TTL_SECONDS", "3600")
+        )
+        # Background refresh runs periodically to catch drift.
+        # Default 3600s (1 hr); override with SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS.
+        self._refresh_interval_seconds = int(
+            __import__("os").getenv("SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS", "3600")
+        )
         self._registries: Dict[str, Dict[str, List[str]]] = {}
         self._enriched: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._last_loaded_at: Dict[str, float] = {}
+        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_lock = asyncio.Lock()
 
     @property
     def cache_dir(self) -> Path:
         return self._cache_dir
 
+    @property
+    def ttl_seconds(self) -> int:
+        return self._ttl_seconds
+
     def _tenant_cache_path(self, tenant_id: str) -> Path:
         return self._cache_dir / f"{tenant_id.upper()}.json"
+
+    def _now(self) -> float:
+        import time as _time
+        return _time.time()
+
+    def _is_stale(self, tenant_key: str) -> bool:
+        """Return True if the tenant's in-memory cache exceeds the TTL."""
+        last = self._last_loaded_at.get(tenant_key)
+        if last is None:
+            return True
+        return (self._now() - last) > self._ttl_seconds
 
     def _load_tenant_from_cache(self, tenant_id: str) -> Dict[str, List[str]]:
         """Load a single tenant registry from its JSON cache file.
@@ -89,7 +123,7 @@ class SchemaRegistryService:
                         cached = json.load(f)
                     if isinstance(cached, dict) and cached.get("schemas"):
                         schemas = {
-                            k: [str(t).upper() for t in v if isinstance(v, list)]
+                            k: [str(t).upper() for t in v if isinstance(t, str)]
                             for k, v in cached["schemas"].items()
                         }
                         logger.info(
@@ -111,7 +145,7 @@ class SchemaRegistryService:
     def load_tenant(self, tenant_id: str) -> Dict[str, List[str]]:
         """Load registry for a single tenant, preferring cache then fallbacks."""
         tenant_key = tenant_id.upper()
-        if tenant_key in self._registries:
+        if tenant_key in self._registries and not self._is_stale(tenant_key):
             return self._registries[tenant_key]
 
         schemas = self._load_tenant_from_cache(tenant_id)
@@ -119,6 +153,7 @@ class SchemaRegistryService:
             schemas = self._load_tenant_from_fallbacks(tenant_id)
 
         self._registries[tenant_key] = schemas
+        self._last_loaded_at[tenant_key] = self._now()
         if schemas:
             logger.info(
                 "SchemaRegistry: loaded %d schemas for tenant=%s",
@@ -174,9 +209,9 @@ class SchemaRegistryService:
         return sorted(tenant_ids)
 
     def get_registry(self, tenant_id: str) -> Dict[str, List[str]]:
-        """Return the registry for the given tenant, loading on demand if needed."""
+        """Return the registry for the given tenant, loading/reloading on demand if needed."""
         tenant_key = tenant_id.upper()
-        if tenant_key not in self._registries:
+        if tenant_key not in self._registries or self._is_stale(tenant_key):
             return self.load_tenant(tenant_id)
         return self._registries[tenant_key]
 
@@ -195,11 +230,17 @@ class SchemaRegistryService:
             total_tables += tenant_tables
             tenant_schemas[tenant_key] = tenant_tables
 
+        age = {}
+        for tenant_key, ts in self._last_loaded_at.items():
+            age[tenant_key] = round(self._now() - ts, 1)
+
         return {
             "tenants_loaded": len(self._registries),
             "total_schemas": total_schemas,
             "total_tables": total_tables,
             "tenant_schemas": tenant_schemas,
+            "tenant_age_seconds": age,
+            "ttl_seconds": self._ttl_seconds,
             "cache_dir": str(self._cache_dir),
         }
 
@@ -208,12 +249,14 @@ class SchemaRegistryService:
         tenant_key = tenant_id.upper()
         self._registries.pop(tenant_key, None)
         self._enriched.pop(tenant_key, None)
+        self._last_loaded_at.pop(tenant_key, None)
         logger.info("SchemaRegistry: invalidated cache for tenant=%s", tenant_id)
 
     def invalidate_all(self) -> None:
         """Clear all in-memory registries."""
         self._registries.clear()
         self._enriched.clear()
+        self._last_loaded_at.clear()
         logger.info("SchemaRegistry: invalidated all caches")
 
     def enrich_schema_with_semantics(
@@ -258,7 +301,7 @@ class SchemaRegistryService:
                                 desc = str(item.get("description") or "").strip()
                                 if desc:
                                     description = desc
-                                break
+                                    break
                     if description or columns:
                         table_meta[table] = {
                             "description": description,
@@ -277,6 +320,78 @@ class SchemaRegistryService:
     def get_enriched_schema(self, tenant_id: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Return enriched schema metadata for the given tenant."""
         return self._enriched.get(tenant_id.upper(), {})
+
+    async def start_background_refresh(
+        self,
+        tenant_ids: List[str],
+        hana_manager: Any,
+        refresh_interval_seconds: Optional[int] = None,
+    ) -> None:
+        """Start a background task that periodically refreshes tenant registries.
+
+        The task compares the live HANA registry against the cached one and
+        reloads when they differ.  It never cancels an in-flight refresh.
+        """
+        if self._refresh_task is not None:
+            return
+
+        interval = refresh_interval_seconds if refresh_interval_seconds is not None else int(
+            __import__("os").getenv("SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS", str(self._ttl_seconds))
+        )
+
+        async def _refresh_loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                for tenant_id in tenant_ids:
+                    tenant_key = tenant_id.upper()
+                    async with self._refresh_lock:
+                        try:
+                            client = hana_manager.get_client(tenant_id)
+                            raw_schemas = client.call_tool("hana_list_schemas", {})
+                            try:
+                                from agent.main import _normalize_name_list
+                                normalized = _normalize_name_list(raw_schemas)
+                            except Exception:
+                                normalized = []
+                            
+                            live_schemas: Dict[str, List[str]] = {}
+                            for schema_name in normalized:
+                                try:
+                                    raw_tables = client.call_tool("hana_list_tables", {"schema_name": schema_name})
+                                    try:
+                                        from agent.main import _normalize_name_list
+                                        tables = _normalize_name_list(raw_tables)
+                                    except Exception:
+                                        tables = []
+                                    if tables:
+                                        live_schemas[schema_name] = tables
+                                except Exception as e:
+                                    logger.warning("SchemaRegistry: background list_tables failed for %s: %s", schema_name, e)
+                            
+                            cached_schemas = self._registries.get(tenant_key, {})
+                            if live_schemas != cached_schemas:
+                                logger.info(
+                                    "SchemaRegistry: background refresh triggered reload for tenant=%s (cached=%d schemas, live=%d schemas)",
+                                    tenant_id, len(cached_schemas), len(live_schemas),
+                                )
+                                self._registries[tenant_key] = live_schemas
+                                self._last_loaded_at[tenant_key] = self._now()
+                                try:
+                                    cache_file = self._tenant_cache_path(tenant_id)
+                                    self._cache_dir.mkdir(parents=True, exist_ok=True)
+                                    with open(cache_file, "w", encoding="utf-8") as f:
+                                        json.dump({"schemas": live_schemas, "updated_at": self._now()}, f)
+                                except Exception as e:
+                                    logger.warning("SchemaRegistry: background cache write failed for tenant=%s: %s", tenant_id, e)
+                        except Exception as e:
+                            logger.warning("SchemaRegistry: background refresh failed for tenant=%s: %s", tenant_id, e)
+
+        self._refresh_task = asyncio.create_task(_refresh_loop())
+        logger.info(
+            "SchemaRegistry: background refresh started (interval=%ds, tenants=%s)",
+            interval,
+            ", ".join(tenant_ids),
+        )
 
 
 # Global singleton (must be after class definitions)

@@ -45,6 +45,15 @@ def build_tone_aware_guidance(tone_context: Dict) -> str:
             "fetch raw values and set client_side_binning for dynamic binning."
         )
 
+    if category == "workforce_analytics":
+        guidance_parts.append(
+            "- WORKFORCE PRODUCTIVITY QUERY: Present results as a concise KPI table with columns: KPI | Current Value | Target | Status. "
+            "Use bold KPI names and clear status indicators. "
+            "Available computations from existing data: HR-to-Employee Ratio and Absenteeism Rate. "
+            "For unsupported metrics, state 'N/A - requires [specific data source]' rather than guessing. "
+            "End with a brief 'Why it matters' sentence explaining the HR business impact."
+        )
+
     if category == "policy_info":
         guidance_parts.append(
             "- POLICY QUERY: The user wants to know a rule or procedure. "
@@ -213,6 +222,7 @@ def build_tool_calling_system_prompt(
     rag_status: str,
     tone_guidance: str = "",
     hana_schema_registry: Optional[Dict[str, List[str]]] = None,
+    hana_semantic_block: Optional[str] = None,
 ) -> str:
     parts = [
         "You are an HR AI agent with DAB data access. Use the available tools to fetch data. "
@@ -224,10 +234,16 @@ def build_tool_calling_system_prompt(
         "",
         *_build_hana_prompt_block(hana_schema_registry),
         "",
+    ]
+
+    if hana_semantic_block:
+        parts.extend(["", hana_semantic_block, ""])
+
+    parts.extend([
         "Entities: " + entity_list,
         "",
         "RAG: " + rag_status + ".",
-    ]
+    ])
 
     if user_context:
         parts.extend(["", user_context])
@@ -290,5 +306,6 @@ def _build_hana_prompt_block(
         "- HANA tools return {'columns': [...], 'rows': {...}}",
         "- HANA queries do NOT support OData filters; write plain SQL.",
         "- HANA IDENTIFIER RULES: Unquoted identifiers are case-insensitive and stored as UPPERCASE. Quoted identifiers are case-sensitive. Always use UPPERCASE unquoted identifiers in SQL, e.g., SELECT COUNT(*) FROM BKPF or SELECT COUNT(*) FROM DBADMIN.BKPF. NEVER use lowercase quoted identifiers like 'bkpf' or 'DBADMIN.bkpf'; HANA will reject them.",
+        "- FINANCIAL QUERY TIME HANDLING: When user asks for annual financial metrics (gross profit, margin, revenue, EBITDA, net profit, expenses, financial ratios) WITHOUT specifying a year, default to the MOST RECENT COMPLETE FISCAL YEAR, not the current year. Current year data is often incomplete. If current year is 2026, prefer 2025 for annual financials unless user explicitly requests 2026. For quarterly/monthly data, use the most recent complete period. Always mention the year/period used in your answer so the user knows what data was queried.",
     ])
     return schema_lines

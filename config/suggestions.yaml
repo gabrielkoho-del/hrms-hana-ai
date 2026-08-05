@@ -48,6 +48,16 @@ aggregate_data:
     - "Check if the data exists in a different time period"
     - "Contact the data owner or HR analytics team"
 
+workforce_analytics:
+  has_data:
+    - "Export this KPI summary to Excel"
+    - "Drill down by department or location"
+    - "Show a trend chart over time"
+  empty_result:
+    - "Verify whether the required source data exists for this metric"
+    - "Check if this metric needs additional HANA or DAB sources"
+    - "Contact HR analytics to define the target and formula"
+
 policy_info:
   has_data:
     - "Would you like the policy in a specific format?"

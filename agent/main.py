@@ -35,11 +35,11 @@ from agent.integrations.rag_retriever import rag_retriever, retrieve_policy_cont
 
 from agent.auth import verify_token, AuthContext
 from agent.config import (
-    MCP_SERVER_URL,
     CHROMA_DB_PATH, CHROMA_COLLECTION_NAME, RAG_TOP_K, RAG_SIMILARITY_THRESHOLD,
     LARGE_RESULT_THRESHOLD, AGENT_BASE_URL, DEFAULT_MAX_ROWS, MAX_SQL_LENGTH,
     UNLIMITED_ROWS, RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW_SECONDS,
-    CONTEXT_WINDOW_SIZE, MAX_TOKENS
+    CONTEXT_WINDOW_SIZE, MAX_TOKENS, SCHEMA_REGISTRY_TTL_SECONDS,
+    SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS
 )
 from agent.output.chart_generator import generate_chart, extract_chartable_data, CHART_OUTPUT_DIR
 from agent.core.tool_planner import build_tool_plan
@@ -240,11 +240,12 @@ async def _discover_hana_schemas(tenant_id: str) -> Dict[str, List[str]]:
     """Discover HANA schemas and their tables once at startup.
 
     Uses the SchemaRegistryService for cache loading and falls back
-    to live HANA discovery if no cache exists.
+    to live HANA discovery if no cache exists or if the cached registry
+    is stale or mismatched.
     """
     from agent.integrations.hana_client import hana_manager
 
-    # Try loading from the registry service first
+    # Use the registry service's TTL-aware get_registry()
     cached = schema_registry_service.get_registry(tenant_id)
     if cached:
         logger.info("HANA schema loaded from registry service for tenant=%s (%d schemas)", tenant_id, len(cached))
@@ -268,8 +269,18 @@ async def _discover_hana_schemas(tenant_id: str) -> Dict[str, List[str]]:
             except Exception as e:
                 logger.warning("HANA list_tables failed for schema=%s: %s", schema_name, e)
 
+        # P1: Compare with any existing cached registry and invalidate on mismatch
+        existing = schema_registry_service._registries.get(tenant_id.upper())
+        if existing and existing != schemas:
+            logger.info(
+                "HANA schema registry mismatch for tenant=%s (cached=%d schemas, live=%d schemas) — invalidating cache",
+                tenant_id, len(existing), len(schemas),
+            )
+            schema_registry_service.invalidate_tenant(tenant_id)
+
         # Persist to registry service and disk
         schema_registry_service._registries[tenant_id.upper()] = schemas
+        schema_registry_service._last_loaded_at[tenant_id.upper()] = schema_registry_service._now()
         cache_file = schema_registry_service._tenant_cache_path(tenant_id)
         schema_registry_service._cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_file, "w", encoding="utf-8") as f:
@@ -424,6 +435,77 @@ def filter_tool_results(tool: str, result_text: str, auth_context: AuthContext) 
     return result_text
 
 
+async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
+    """Validate loaded registries at startup and refresh stale/mismatched ones.
+
+    For each loaded tenant:
+      - If no cache file exists, skip (already loaded from HANA at startup).
+      - If cache is older than TTL, re-discover from HANA and overwrite cache.
+      - If cache file differs from live HANA discovery, invalidate and reload.
+    """
+    tenant_ids = list(schema_registry_service.get_all_tenants())
+    if not tenant_ids:
+        return
+
+    for tenant_id in tenant_ids:
+        tenant_key = tenant_id.upper()
+        cache_file = schema_registry_service._tenant_cache_path(tenant_id)
+        cached_schemas = schema_registry_service._registries.get(tenant_key, {})
+        is_stale = schema_registry_service._is_stale(tenant_key)
+        cache_exists = cache_file.exists()
+
+        if not cache_exists:
+            logger.info("SchemaRegistry: startup validation skipped for tenant=%s (no cache file)", tenant_id)
+            continue
+
+        if not is_stale and cached_schemas:
+            try:
+                client = hana_manager.get_client(tenant_id)
+                raw_schemas = client.call_tool("hana_list_schemas", {})
+                try:
+                    from agent.main import _normalize_name_list
+                    normalized = _normalize_name_list(raw_schemas)
+                except Exception:
+                    normalized = []
+
+                live_schemas: Dict[str, List[str]] = {}
+                for schema_name in normalized or []:
+                    try:
+                        raw_tables = client.call_tool("hana_list_tables", {"schema_name": schema_name})
+                        try:
+                            from agent.main import _normalize_name_list
+                            tables = _normalize_name_list(raw_tables)
+                        except Exception:
+                            tables = []
+                        if tables:
+                            live_schemas[schema_name] = tables
+                    except Exception as e:
+                        logger.debug("SchemaRegistry: startup validation list_tables failed for %s: %s", schema_name, e)
+
+                if live_schemas != cached_schemas:
+                    logger.info(
+                        "SchemaRegistry: startup mismatch detected for tenant=%s (cached=%d schemas, live=%d schemas) — refreshing",
+                        tenant_id, len(cached_schemas), len(live_schemas),
+                    )
+                    schema_registry_service.invalidate_tenant(tenant_id)
+                    schema_registry_service._registries[tenant_key] = live_schemas
+                    schema_registry_service._last_loaded_at[tenant_key] = schema_registry_service._now()
+                    schema_registry_service._cache_dir.mkdir(parents=True, exist_ok=True)
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        json.dump({"schemas": live_schemas, "updated_at": schema_registry_service._now()}, f)
+                else:
+                    logger.info("SchemaRegistry: startup validation passed for tenant=%s (cache matches live)", tenant_id)
+            except Exception as e:
+                logger.warning("SchemaRegistry: startup validation failed for tenant=%s: %s", tenant_id, e)
+        elif is_stale:
+            logger.info(
+                "SchemaRegistry: startup stale cache detected for tenant=%s (age=%ds > TTL=%ds) — will reload on next access",
+                tenant_id,
+                int(schema_registry_service._now() - schema_registry_service._last_loaded_at.get(tenant_key, 0)),
+                schema_registry_service.ttl_seconds,
+            )
+
+
 # ==============================
 # FASTAPI APP
 # ==============================
@@ -447,6 +529,14 @@ async def lifespan(app: FastAPI):
     for tenant_id, schemas in schema_registry_service._registries.items():
         CACHED_HANA_SCHEMAS.update(schemas)
 
+    # Validate and refresh stale/mismatched registries at startup
+    await _validate_and_refresh_startup_registries(hana_manager)
+
+    # Refresh CACHED_HANA_SCHEMAS after validation in case any registries were updated
+    CACHED_HANA_SCHEMAS.clear()
+    for tenant_id, schemas in schema_registry_service._registries.items():
+        CACHED_HANA_SCHEMAS.update(schemas)
+
     # Warm up the same HANA tenant used for DAB discovery (no separate LOCALDEV)
     discovery_tenant = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
     try:
@@ -454,7 +544,25 @@ async def lifespan(app: FastAPI):
         logger.info("HANA MCP client warmed up for discovery tenant: %s", discovery_tenant)
     except Exception as e:
         logger.info("HANA MCP warmup skipped or unavailable for tenant %s: %s", discovery_tenant, e)
+
+    # Start background schema registry refresh (P2)
+    try:
+        await schema_registry_service.start_background_refresh(
+            tenant_ids=list(schema_registry_service.get_all_tenants()),
+            hana_manager=hana_manager,
+            refresh_interval_seconds=SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("SchemaRegistry: background refresh startup failed: %s", e)
+
     yield
+    # Cancel background refresh on shutdown
+    if schema_registry_service._refresh_task is not None:
+        schema_registry_service._refresh_task.cancel()
+        try:
+            await schema_registry_service._refresh_task
+        except asyncio.CancelledError:
+            pass
     dab_manager.close_all()
     hana_manager.close_all()
 
