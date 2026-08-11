@@ -32,7 +32,7 @@ from agent.output.export_service import (
 from agent.integrations.llm_client import call_llm
 from agent.config import LARGE_RESULT_THRESHOLD
 from agent.integrations.rag_retriever import retrieve_policy_context
-from agent.output.chart_generator import generate_chart, extract_chartable_data, _is_aggregate_value_col
+from agent.output.chart_generator import generate_chart, extract_chartable_data, _is_aggregate_value_col, _detect_wide_format_metrics
 from agent.core.tool_planner import build_tool_plan
 from agent.summarizer.response_summarizer import summarize_results
 from agent.core.intent_classifier import classify_intent, IntentResult, _is_short_affirmative
@@ -90,6 +90,122 @@ def _get_executor(tool_name: str):
     if tool_name.startswith("hana_"):
         return _execute_hana_tool_call
     return None
+
+
+def _calculate_variances(data: List[Dict], metric_cols: List[str], x_col: str) -> List[Dict]:
+    """Calculate period-over-period variances for financial metrics.
+
+    Handles edge cases:
+    - Division by zero when prior period value is 0
+    - Missing periods (gaps in time series)
+    - NaN/None values
+    - Negative values (valid for financial data)
+
+    Returns list of variance dicts with:
+      - period: the time period
+      - metric: metric name
+      - current: current period value
+      - prior: prior period value (None if first period)
+      - abs_change: absolute change
+      - pct_change: percentage change (None if prior is 0 or None)
+      - is_material: bool indicating if change is material (>10% and abs > threshold)
+    """
+    if not data or not metric_cols:
+        return []
+
+    variances = []
+    for i, row in enumerate(data):
+        current_period = row.get(x_col)
+        if current_period is None:
+            continue
+
+        for metric in metric_cols:
+            current_val = row.get(metric)
+            if current_val is None:
+                continue
+
+            try:
+                current_num = float(current_val)
+            except (TypeError, ValueError):
+                continue
+
+            prior_val = data[i - 1].get(metric) if i > 0 else None
+            prior_period = data[i - 1].get(x_col) if i > 0 else None
+
+            prior_num = None
+            if prior_val is not None:
+                try:
+                    prior_num = float(prior_val)
+                except (TypeError, ValueError):
+                    prior_num = None
+
+            abs_change = None
+            pct_change = None
+            is_material = False
+
+            if prior_num is not None:
+                abs_change = current_num - prior_num
+                if prior_num != 0:
+                    pct_change = (abs_change / abs(prior_num)) * 100
+                    # Material variance: >10% change and absolute change > 1000
+                    if abs(pct_change) > 10 and abs(abs_change) > 1000:
+                        is_material = True
+
+            variances.append({
+                "period": current_period,
+                "metric": metric,
+                "current": current_num,
+                "prior": prior_num,
+                "prior_period": prior_period,
+                "abs_change": abs_change,
+                "pct_change": pct_change,
+                "is_material": is_material,
+            })
+
+    return variances
+
+
+def _format_variances_for_prompt(variances: List[Dict], max_items: int = 20) -> str:
+    """Format variance data as human-readable text for LLM prompt."""
+    if not variances:
+        return ""
+
+    lines = ["KEY VARIANCES (period-over-period):"]
+    material = [v for v in variances if v.get("is_material")]
+    if material:
+        lines.append("Material changes (>10% or >1000):")
+        for v in material[:max_items]:
+            metric = v["metric"].replace("_", " ").title()
+            direction = "increase" if v.get("abs_change", 0) > 0 else "decrease"
+            pct = f"{v['pct_change']:.1f}%" if v.get("pct_change") is not None else "N/A"
+            lines.append(
+                f"- {metric}: {direction} of {abs(v.get('abs_change', 0)):,.0f} ({pct}) "
+                f"in period {v['period']}"
+            )
+    else:
+        lines.append("No material variances detected.")
+
+    # Add summary statistics per metric
+    metrics_seen = {}
+    for v in variances:
+        m = v["metric"]
+        if m not in metrics_seen:
+            metrics_seen[m] = []
+        if v.get("abs_change") is not None:
+            metrics_seen[m].append(v["abs_change"])
+
+    if metrics_seen:
+        lines.append("")
+        lines.append("Overall trends:")
+        for metric, changes in metrics_seen.items():
+            if not changes:
+                continue
+            total_change = sum(changes)
+            direction = "upward" if total_change > 0 else "downward" if total_change < 0 else "flat"
+            metric_label = metric.replace("_", " ").title()
+            lines.append(f"- {metric_label}: overall {direction} trend ({total_change:+,.0f})")
+
+    return "\n".join(lines)
 
 
 async def run_reflexive_agent(
@@ -291,7 +407,9 @@ async def run_reflexive_agent(
             "FOLLOW_UP_EXPORT: restored chart_config from session (type=%s), overriding planner default",
             chart_config.get("type")
         )
-        if not chartable_data and session_state.get("last_chart_data"):
+        # Only restore cached data when there are no fresh tool results.
+        # If new tool calls were made, the extraction loop below will populate chartable_data.
+        if not state.get("tool_calls_made") and not chartable_data and session_state.get("last_chart_data"):
             chartable_data = list(session_state["last_chart_data"])
             logger.info("FOLLOW_UP_EXPORT: restored %d cached rows", len(chartable_data))
     elif 'chart_config' not in locals() or not chart_config:
@@ -345,6 +463,75 @@ async def run_reflexive_agent(
                 auth_role, 
                 sorted(perms) if perms else None,
                 sorted(roles) if roles else None)
+
+    if chart_config and isinstance(chart_config, dict) and chartable_data:
+        # If planner left chart metadata empty (common for HANA raw-SQL paths),
+        # derive x/y/title from the actual result columns and the user query.
+        if not chart_config.get("y_column") and chartable_data:
+            first_row = chartable_data[0]
+            cols = list(first_row.keys())
+            q = user_query.lower()
+            # Match query keywords against available columns to pick the intended metric.
+            metric_keywords = [
+                "profit", "revenue", "income", "expense", "cost", "margin",
+                "amount", "balance", "salary", "headcount", "count", "total",
+                "net", "ebitda", "turnover", "rate", "value", "quantity",
+            ]
+            matched_col = None
+            for kw in metric_keywords:
+                candidates = [c for c in cols if kw in c.lower()]
+                if candidates:
+                    matched_col = candidates[0]
+                    break
+            if matched_col:
+                chart_config["y_column"] = matched_col
+                logger.info("CHART_DEBUG_EXECUTOR: derived y_column='%s' from user query", matched_col)
+            else:
+                # Fallback: first numeric-looking column that is not the x-axis/time column
+                import pandas as pd
+                df = pd.DataFrame(chartable_data)
+                numeric_cols = [
+                    c for c in df.columns
+                    if pd.api.types.is_numeric_dtype(df[c])
+                ]
+                if numeric_cols:
+                    chart_config["y_column"] = numeric_cols[0]
+                    logger.info("CHART_DEBUG_EXECUTOR: fallback y_column='%s' from numeric cols", numeric_cols[0])
+
+        chart_markdown = generate_chart(
+            data=chartable_data,
+            chart_type=chart_config.get("type", "bar"),
+            x_column=chart_config.get("x_column"),
+            y_column=chart_config.get("y_column"),
+            title=chart_config.get("title"),
+            y_label=chart_config.get("y_label"),
+            auth_role=auth_role,
+            include_table=True,
+            multi_series=chart_config.get("multi_series", False),
+            metrics=chart_config.get("metrics", []),
+        )
+        logger.info("CHART_DEBUG_EXECUTOR: generated chart_markdown len=%d", len(chart_markdown))
+    elif not chart_config and chartable_data:
+        # Defensive fallback: if planner missed chart intent but we have chartable data,
+        # generate a default bar chart for HANA / aggregate queries that look chartable.
+        q = user_query.lower()
+        looks_like_chart_request = any(
+            kw in q for kw in ("chart", "graph", "visualize", "plot", "bar", "pie", "line")
+        )
+        has_multiple_cols = bool(chartable_data) and isinstance(chartable_data[0], dict) and len(chartable_data[0]) >= 2
+        if looks_like_chart_request and has_multiple_cols:
+            logger.info("CHART_DEBUG_EXECUTOR: fallback chart generation for missed chart intent")
+            chart_markdown = generate_chart(
+                data=chartable_data,
+                chart_type="bar",
+                x_column=None,
+                y_column=None,
+                title=None,
+                y_label=None,
+                auth_role=auth_role,
+                include_table=True,
+            )
+            logger.info("CHART_DEBUG_EXECUTOR: fallback generated chart_markdown len=%d", len(chart_markdown))
 
     if not chart_config:
         logger.info("CHART_DEBUG_EXECUTOR: no chart_config in plan")
@@ -403,6 +590,25 @@ async def run_reflexive_agent(
         logger.info("CHART_DEBUG_INJECT: injected __chart len=%d", len(chart_markdown))
     else:
         logger.info("CHART_DEBUG_INJECT: no chart_markdown to inject")
+
+    # Inject variance analysis for multi-metric financial reports
+    variance_text = ""
+    if chartable_data and isinstance(chart_config, dict) and chart_config.get("multi_series"):
+        metrics = chart_config.get("metrics", []) or _detect_wide_format_metrics(chartable_data, None)
+        x_col = next(iter(chartable_data[0].keys())) if chartable_data else "period"
+        # Find x column
+        for candidate in ["POPER", "MONTH", "PERIOD", "YEAR", "QUARTER"]:
+            if candidate in chartable_data[0]:
+                x_col = candidate
+                break
+        variances = _calculate_variances(chartable_data, metrics, x_col)
+        variance_text = _format_variances_for_prompt(variances)
+        if variance_text:
+            tool_results_for_summarizer["__variances"] = {
+                "result": variance_text,
+                "args": {"type": "variance_analysis"}
+            }
+            logger.info("CHART_DEBUG_VARIANCE: injected __variances len=%d", len(variance_text))
 
     action_context = plan.get("action_context", "")
 

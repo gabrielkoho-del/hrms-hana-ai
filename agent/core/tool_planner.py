@@ -10,6 +10,7 @@ All previous fixes preserved:
   • Aligned client-side binning example
 """
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -67,6 +68,139 @@ def _load_hana_semantic_schema() -> Optional[Dict]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# SEMANTIC TEMPLATE ENFORCEMENT — programmatic SQL from hana-semantics-hr.json
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _match_semantic_pattern(user_query: str, hana_semantic_schema: Optional[Dict]) -> Optional[Dict]:
+    """Match user query against hana-semantics-hr.json query_patterns.
+
+    Returns pattern match dict with sql_template if matched, None otherwise.
+    Matching is based on domain keyword overlap between user_query and
+    the pattern's when_to_use description.
+    """
+    if not hana_semantic_schema or "query_patterns" not in hana_semantic_schema:
+        return None
+
+    q_lower = user_query.lower()
+    patterns = hana_semantic_schema["query_patterns"]
+
+    for pattern_name, pattern_def in patterns.items():
+        when_to_use = pattern_def.get("when_to_use", "").lower()
+        sql_template = pattern_def.get("sql_template", "")
+        if not sql_template:
+            continue
+
+        # Extract domain keywords from when_to_use description
+        domain_keywords = set()
+        if "vendor" in when_to_use or "supplier" in when_to_use:
+            domain_keywords.update(["vendor", "supplier", "ap ", "accounts payable", "expense", "cost", "payment"])
+        if "customer" in when_to_use:
+            domain_keywords.update(["customer", "client", "ar ", "accounts receivable", "revenue", "sales"])
+        if "revenue" in when_to_use:
+            domain_keywords.update(["revenue", "sales", "turnover"])
+        if "expense" in when_to_use or "cost" in when_to_use:
+            domain_keywords.update(["expense", "cost", "payment"])
+        if "aging" in when_to_use:
+            domain_keywords.update(["aging", "overdue", "open item", "open items"])
+        if "period" in when_to_use or "month" in when_to_use or "quarter" in when_to_use:
+            domain_keywords.update(["by month", "by quarter", "by period", "trend", "monthly", "quarterly"])
+
+        # Check if query matches this pattern's domain
+        if not any(kw in q_lower for kw in domain_keywords):
+            continue
+
+        # For top-N patterns, require ranking language
+        if pattern_name.startswith("top_") or "top" in when_to_use:
+            if not any(kw in q_lower for kw in ["top", "best", "highest", "largest", "rank"]):
+                continue
+
+        return {
+            "pattern_name": pattern_name,
+            "sql_template": sql_template,
+            "correct_source": pattern_def.get("correct_source"),
+            "incorrect_source": pattern_def.get("incorrect_source"),
+        }
+
+    return None
+
+
+def _repair_sql_with_semantic_template(
+    sql: str,
+    user_query: str,
+    hana_semantic_schema: Optional[Dict],
+    tenant_id: str = "default",
+) -> Optional[str]:
+    """Attempt to repair invalid SQL using a semantic template from hana-semantics-hr.json.
+
+    Returns repaired SQL if a matching template is found, None otherwise.
+    """
+    match = _match_semantic_pattern(user_query, hana_semantic_schema)
+    if not match:
+        return None
+
+    sql_template = match["sql_template"]
+
+    # Extract {n} from user query (e.g., "top 5", "top 10")
+    n_match = re.search(r'\btop\s+(\d+)\b', user_query, re.IGNORECASE)
+    n = int(n_match.group(1)) if n_match else 5
+
+    # Extract {year}
+    year = _extract_year_from_query(user_query)
+    if year is None:
+        year = datetime.now().year - 1
+
+    try:
+        repaired = sql_template.format(n=n, year=year)
+        logger.info(
+            "SEMANTIC_TEMPLATE_REPAIR: pattern=%s replaced invalid SQL with template SQL",
+            match["pattern_name"]
+        )
+        return repaired
+    except (KeyError, ValueError) as e:
+        logger.warning("Semantic template substitution failed for %s: %s", match["pattern_name"], e)
+        return None
+
+
+def _validate_hana_sql(query: str) -> tuple[bool, Optional[str]]:
+    """Validate HANA SQL for common correctness issues.
+
+    Lightweight regex-based validation. No external dependencies.
+    Returns (is_valid, error_message).
+    """
+    if not query or not isinstance(query, str):
+        return False, "Empty or invalid SQL query"
+
+    q = query.strip()
+    q_upper = q.upper()
+
+    # Check 1: Aggregate without GROUP BY when non-aggregated columns are selected
+    has_aggregate = bool(re.search(r'\b(SUM|COUNT|AVG|MIN|MAX)\s*\(', q_upper))
+    has_group_by = bool(re.search(r'\bGROUP\s+BY\b', q_upper))
+
+    if has_aggregate and not has_group_by:
+        select_part = re.search(r'SELECT\s+(.*?)\s+FROM', q_upper, re.DOTALL | re.IGNORECASE)
+        if select_part:
+            cols = select_part.group(1)
+            # Remove aggregate expressions to check for non-aggregated columns
+            cols_without_agg = re.sub(r'\b(SUM|COUNT|AVG|MIN|MAX)\s*\([^)]*\)', '', cols)
+            # If there's still a column name, there are non-aggregated columns
+            if re.search(r'\b[A-Z_][A-Z0-9_]*\b', cols_without_agg):
+                return False, "SQL contains aggregate functions with non-aggregated columns but no GROUP BY clause"
+
+    # Check 2: JOIN without ON clause
+    joins = re.findall(r'\bJOIN\b', q_upper)
+    ons = re.findall(r'\bON\b', q_upper)
+    if joins and len(ons) < len(joins):
+        return False, f"SQL contains {len(joins)} JOIN(s) but only {len(ons)} ON clause(s) — possible Cartesian product"
+
+    # Check 3: CROSS JOIN
+    if re.search(r'\bCROSS\s+JOIN\b', q_upper):
+        return False, "SQL contains CROSS JOIN — verify this is intentional"
+
+    return True, None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # TEMPORAL REASONING — Intemporal context resolution for financial queries
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -74,7 +208,7 @@ _FINANCIAL_METRIC_KEYWORDS = frozenset({
     "gross profit", "gross margin", "net profit", "net margin", "ebitda",
     "revenue", "sales", "income", "expense", "cost", "budget", "actual",
     "balance sheet", "cash flow", "cashflow", "profitability", "margin",
-    "financial", "finance", "fiscal", "accounting", "gl ", "general ledger",
+    "profit", "financial", "finance", "fiscal", "accounting", "gl ", "general ledger",
     "accounts payable", "accounts receivable", "ap ", "ar ", "invoice",
     "vendor", "customer", "payment", "receipt", "bank", "cash", "asset",
     "liability", "equity", "depreciation", "amortization", "tax",
@@ -254,6 +388,29 @@ def _format_hana_semantics_for_prompt(
 
     text = "\n".join(lines)
 
+    # Append query patterns if available
+    query_patterns = semantic_schema.get("query_patterns", {})
+    if query_patterns:
+        pattern_lines = ["\nQUERY PATTERNS — use these templates for common financial queries:"]
+        for pattern_name, pattern_def in query_patterns.items():
+            desc = pattern_def.get("description", "")
+            correct = pattern_def.get("correct_source", "")
+            incorrect = pattern_def.get("incorrect_source", "")
+            sql = pattern_def.get("sql_template", "")
+            notes = pattern_def.get("notes", [])
+            if desc:
+                pattern_lines.append(f"  [{pattern_name}] {desc}")
+            if correct:
+                pattern_lines.append(f"    Correct source: {correct}")
+            if incorrect:
+                pattern_lines.append(f"    WRONG: {incorrect}")
+            if sql:
+                pattern_lines.append(f"    Template: {sql}")
+            for note in notes:
+                pattern_lines.append(f"    - {note}")
+        lines.extend(pattern_lines)
+        text = "\n".join(lines)
+
     try:
         tokens = _count_tokens(text)
         if tokens > token_budget:
@@ -329,6 +486,132 @@ class _TTLCache:
 
 
 _schema_cache = _TTLCache(ttl=300, maxsize=100)  # 5 min TTL, 100 entries
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HYBRID METRIC EXTRACTION — Fast gate + LLM fallback with TTL cache
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Industry-pattern: fast deterministic gate for common cases, LLM for
+# ambiguity. Reduces latency for repeated queries and maintains accuracy
+# for paraphrased/multi-metric queries.
+#
+# Path:
+#   1. Normalize query -> cache key
+#   2. Cache hit -> return cached metrics
+#   3. Fast gate (regex word-boundary, longest-match-first)
+#   4. Decision: gate confident? -> cache & return
+#   5. LLM extraction (json_mode=True) -> cache & return
+#
+_METRIC_EXTRACTION_CACHE = _TTLCache(ttl=300, maxsize=256)  # 5 min, 256 entries
+
+_METRIC_FAST_GATE_KEYWORDS = [
+    "gross profit", "gross_profit", "grossprofit",
+    "net profit", "net_profit", "netprofit",
+    "operating income",
+    "revenue", "expense", "profit", "cost", "margin",
+    "ebitda", "income", "loss", "budget", "actual",
+    "profitability",
+]
+
+_METRIC_LLM_PROMPT = """\
+Extract all financial metrics mentioned in this query. Return ONLY JSON:
+{{"metrics": ["revenue", "expense", "profit"], "time_period": "month", "year": 2025}}
+
+Allowed metrics (use these exact lowercase forms):
+revenue, expense, profit, gross_profit, net_profit, ebitda, cost, margin, income, loss, budget, actual, profitability
+
+Query: {query}
+"""
+
+
+def _metric_cache_key(query: str) -> str:
+    normalized = query.lower().strip()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def _extract_metrics_fast_gate(query: str) -> List[str]:
+    """Regex word-boundary extraction with longest-match-first ordering.
+
+    Returns deduplicated list preserving match order (most specific first).
+    """
+    q = query.lower()
+    found: List[str] = []
+    # Sort by length descending so "gross profit" matches before "profit"
+    for kw in sorted(_METRIC_FAST_GATE_KEYWORDS, key=len, reverse=True):
+        pattern = re.compile(r'\b' + re.escape(kw) + r'\b', re.IGNORECASE)
+        if pattern.search(q) and kw not in found:
+            found.append(kw)
+    return found
+
+
+def _should_fallback_to_llm(fast_metrics: List[str], query: str) -> bool:
+    """Heuristic: when is the fast gate likely wrong or incomplete?"""
+    q = query.lower()
+    if not fast_metrics:
+        return True
+    # If user mentions multiple distinct financial terms but gate found only one
+    financial_terms = ["revenue", "expense", "profit", "cost", "margin", "income", "loss", "budget", "actual", "ebitda"]
+    mentioned = [t for t in financial_terms if t in q]
+    if len(mentioned) >= 2 and len(fast_metrics) < 2:
+        return True
+    return False
+
+
+async def _extract_metrics_llm(query: str) -> List[str]:
+    """LLM-based metric extraction using structured JSON response."""
+    prompt = _METRIC_LLM_PROMPT.format(query=query)
+    try:
+        result = await asyncio.to_thread(
+            call_llm,
+            system_prompt="You are a financial query analyzer. Extract metrics precisely.",
+            user_prompt=prompt,
+            temperature=0.0,
+            max_tokens=256,
+            json_mode=True,
+            tier="executor",
+            estimated_tokens=500,
+        )
+        if not result or not isinstance(result, dict):
+            return []
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content:
+            return []
+        # Strip markdown code fences if present
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0]
+        parsed = json.loads(content.strip())
+        metrics = parsed.get("metrics", [])
+        return [m.lower().strip() for m in metrics if isinstance(m, str)]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        logger.warning("CHART_DEBUG_HYBRID: LLM metric extraction failed: %s", e)
+        return []
+
+
+async def _extract_metrics_hybrid(user_query: str) -> List[str]:
+    """Hybrid extraction: fast gate -> cache -> LLM fallback."""
+    cache_key = _metric_cache_key(user_query)
+    cached = _METRIC_EXTRACTION_CACHE.get(cache_key)
+    if cached is not None:
+        logger.info("CHART_DEBUG_HYBRID: cache hit for query key=%s metrics=%s", cache_key[:8], cached)
+        return cached
+
+    fast_metrics = _extract_metrics_fast_gate(user_query)
+    logger.info("CHART_DEBUG_HYBRID: fast gate metrics=%s", fast_metrics)
+
+    if not _should_fallback_to_llm(fast_metrics, user_query):
+        _METRIC_EXTRACTION_CACHE.set(cache_key, fast_metrics)
+        return fast_metrics
+
+    logger.info("CHART_DEBUG_HYBRID: falling back to LLM extraction")
+    llm_metrics = await _extract_metrics_llm(user_query)
+    logger.info("CHART_DEBUG_HYBRID: LLM metrics=%s", llm_metrics)
+
+    # Prefer LLM result if it found more metrics, otherwise use fast gate
+    final_metrics = llm_metrics if len(llm_metrics) >= len(fast_metrics) else fast_metrics
+    _METRIC_EXTRACTION_CACHE.set(cache_key, final_metrics)
+    return final_metrics
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -963,10 +1246,51 @@ def _normalize_entity_names(steps: List[Dict], cached_schema: Dict) -> List[Dict
 # METADATA INFERENCE — Heuristic chart/rag/binning from query + steps
 # ═════════════════════════════════════════════════════════════════════════════
 
-def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Dict]) -> Dict:
+# Chart intent patterns using word boundaries to avoid false positives
+# (e.g., "chartroom" should not match "chart").
+_CHART_TYPE_PATTERNS = [
+    (re.compile(r"\bbar\s+(chart|graph|plot)\b", re.I), "bar"),
+    (re.compile(r"\bcolumn\s+(chart|graph|plot)\b", re.I), "bar"),
+    (re.compile(r"\bpie\s+(chart|graph|plot|donut)\b", re.I), "pie"),
+    (re.compile(r"\bline\s+(chart|graph|plot|trend|time\s*series)\b", re.I), "line"),
+    (re.compile(r"\bhistogram\b|\bhist\s+chart\b|\bdistribution\s+chart\b", re.I), "hist"),
+    (re.compile(r"\bbox\s*plot\b|\bbox\s*chart\b|\bboxplot\b", re.I), "box"),
+    (re.compile(r"\bgauge\s+chart\b|\bkpi\s+gauge\b|\bgauge\b", re.I), "gauge"),
+]
+
+# General chart intent: user wants a visual representation, but didn't specify type.
+# Uses word boundaries to avoid matching "chartroom", "epicchart", etc.
+_GENERAL_CHART_PATTERN = re.compile(
+    r"\b(chart|graph|visualize|visualization|plot|dashboard|kpi)\b",
+    re.I,
+)
+
+
+def _detect_chart_intent(user_query: str) -> Dict[str, Any]:
+    """Detect chart intent from user query using regex with word boundaries.
+
+    Returns dict with:
+      - explicit_chart_type: str or None
+      - general_chart_intent: bool
+    """
+    query_lower = user_query.lower()
+    explicit_chart_type = None
+    for pattern, chart_type in _CHART_TYPE_PATTERNS:
+        if pattern.search(query_lower):
+            explicit_chart_type = chart_type
+            break
+
+    general_chart_intent = bool(_GENERAL_CHART_PATTERN.search(query_lower))
+    return {
+        "explicit_chart_type": explicit_chart_type,
+        "general_chart_intent": general_chart_intent,
+    }
+
+
+async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Dict]) -> Dict:
     """Infer chart, RAG, client-side binning, and other metadata from query and steps.
 
-    This is deterministic and fast — no extra API call needed.
+    Uses hybrid metric extraction: fast regex gate + LLM fallback with TTL cache.
     """
     metadata = {
         "chart": None,
@@ -986,9 +1310,44 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
     has_read = any(s["tool"] == "read_records" for s in steps)
     has_hana = any(s["tool"].startswith("hana_") for s in steps)
 
+    # Detect explicit chart type request from user query (must happen before HANA early return)
+    chart_intent = _detect_chart_intent(user_query)
+    explicit_chart_type = chart_intent["explicit_chart_type"]
+    general_chart_intent = chart_intent["general_chart_intent"]
+    if explicit_chart_type:
+        logger.info("Planner: explicit chart type detected from query: %s", explicit_chart_type)
+
+    # Also treat tone_context chart_eligible=True as implicit chart intent.
+    tone_context = tone_context or {}
+    chart_eligible = tone_context.get("chart_eligible", False)
+    if not general_chart_intent and chart_eligible and has_hana:
+        general_chart_intent = True
+
+    # Detect multi-metric financial report intent using hybrid extraction.
+    unique_metrics = await _extract_metrics_hybrid(user_query)
+    is_multi_metric = len(unique_metrics) >= 2
+    if is_multi_metric:
+        logger.info("Planner: multi-metric report detected: %s", unique_metrics)
+
     # HANA queries use raw SQL; skip DAB chart/binning metadata inference
+    # BUT preserve explicit chart requests so executor can still generate the chart
     if has_hana and not has_aggregate and not has_read:
         metadata["reasoning"] = f"Selected {len(steps)} HANA tool(s) for direct SQL query."
+        if explicit_chart_type or general_chart_intent:
+            chart_type = explicit_chart_type or "bar"
+            metadata["chart"] = {
+                "type": chart_type,
+                "x_column": "",
+                "y_column": "",
+                "y_label": "",
+                "title": "",
+                "gauge_min": 0 if chart_type == "gauge" else None,
+                "gauge_max": 100 if chart_type == "gauge" else None,
+                "gauge_threshold": 70 if chart_type == "gauge" else None,
+                "trend_line": chart_type == "line" and any(kw in query_lower for kw in ("trend line", "trend", "with trend")),
+                "multi_series": is_multi_metric,
+                "metrics": unique_metrics if is_multi_metric else [],
+            }
         return metadata
 
     # ── Chart inference (intent category + data shape, NOT keywords) ──
@@ -1009,24 +1368,6 @@ def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Di
     # Row count guard: 1-5 rows = no chart (too small), 6-50 = chart, 50+ = chart + export
     # We don't know row count yet, so we plan the chart and let executor decide later
     wants_chart = chart_eligible and has_groupby_like
-
-    # Detect explicit chart type request from user query
-    explicit_chart_type = None
-    query_lower = user_query.lower()
-    if any(kw in query_lower for kw in ("bar chart", "bar graph", "bar plot", "column chart", "column graph")):
-        explicit_chart_type = "bar"
-    elif any(kw in query_lower for kw in ("pie chart", "pie graph", "pie plot", "donut chart")):
-        explicit_chart_type = "pie"
-    elif any(kw in query_lower for kw in ("line chart", "line graph", "trend chart", "time series")):
-        explicit_chart_type = "line"
-    elif any(kw in query_lower for kw in ("histogram", "hist chart", "distribution chart")):
-        explicit_chart_type = "hist"
-    elif any(kw in query_lower for kw in ("box plot", "boxplot", "box chart")):
-        explicit_chart_type = "box"
-    elif any(kw in query_lower for kw in ("gauge chart", "kpi gauge", "gauge")):
-        explicit_chart_type = "gauge"
-    if explicit_chart_type:
-        logger.info("Planner: explicit chart type detected from query: %s", explicit_chart_type)
 
     if wants_chart:
         chart_type = "bar"
@@ -1249,9 +1590,29 @@ async def build_tool_plan(
         steps = _normalize_entity_names(steps, cached_schema)
         logger.info("Planner: Tool calling produced %d steps: %s", len(steps), [s["tool"] for s in steps])
 
+        # ── SQL validation and semantic-template repair ─────────────────────
+        validated_steps = []
+        for step in steps:
+            if step.get("tool") == "hana_execute_query":
+                sql = step.get("args", {}).get("query", "")
+                is_valid, error = _validate_hana_sql(sql)
+                if not is_valid:
+                    logger.warning("HANA SQL validation failed: %s. Query: %.200s", error, sql)
+                    repaired = _repair_sql_with_semantic_template(sql, user_query, hana_semantic_schema, tenant_id)
+                    if repaired:
+                        step = dict(step)
+                        step["args"] = dict(step.get("args", {}))
+                        step["args"]["query"] = repaired
+                        logger.info("HANA SQL repaired with semantic template")
+                    else:
+                        logger.error("HANA SQL rejected, dropping step: %s", error)
+                        continue
+            validated_steps.append(step)
+        steps = validated_steps
+
     if steps:
         # Infer metadata from query + steps (deterministic, no extra API call)
-        metadata = infer_metadata(user_query, steps, tone_context)
+        metadata = await infer_metadata(user_query, steps, tone_context)
 
         # Native tool calling provides structured tool_calls; metadata comes from infer_metadata
 

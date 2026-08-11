@@ -602,7 +602,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: Literal["hr-agent", "hr-agent-fast", "hr-agent-creative"] = "hr-agent"
+    model: Literal["hr-agent", "hr-agent-fast", "hr-agent-creative", "ai-agent"] = "hr-agent"
     messages: List[ChatMessage]
     stream: bool = False
     temperature: Optional[float] = 0.7
@@ -671,12 +671,13 @@ def format_streaming_response(request: ChatCompletionRequest, answer: str):
     async def generate():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created = int(time.time())
+        model = "hr-agent" if request.model == "ai-agent" else request.model
 
         first_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": request.model,
+            "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(first_chunk)}\n\n"
@@ -688,7 +689,7 @@ def format_streaming_response(request: ChatCompletionRequest, answer: str):
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": created,
-                "model": request.model,
+                "model": model,
                 "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
             }
             yield f"data: {json.dumps(data_chunk)}\n\n"
@@ -698,7 +699,7 @@ def format_streaming_response(request: ChatCompletionRequest, answer: str):
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
-            "model": request.model,
+            "model": model,
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
         }
         yield f"data: {json.dumps(stop_chunk)}\n\n"
@@ -708,10 +709,11 @@ def format_streaming_response(request: ChatCompletionRequest, answer: str):
 
 
 def format_json_response(request: ChatCompletionRequest, answer: str):
+    model = "hr-agent" if request.model == "ai-agent" else request.model
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
         created=int(time.time()),
-        model=request.model,
+        model=model,
         choices=[Choice(
             message=ChatMessage(role="assistant", content=answer),
             finish_reason="stop"

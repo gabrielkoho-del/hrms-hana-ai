@@ -120,6 +120,13 @@ def summarize_results(user_query, tool_results, conversation_history="", chart_c
         logger.info("CHART_DEBUG_SUMMARIZER: extracted raw_chart_md len=%d format=%s", 
                     len(raw_chart_md), chart_format)
 
+    # Extract variance analysis if present (multi-metric financial reports)
+    variance_context = ""
+    if "__variances" in tool_results:
+        variance_context = tool_results["__variances"].get("result", "")
+        del tool_results["__variances"]
+        logger.info("CHART_DEBUG_SUMMARIZER: extracted variance_context len=%d", len(variance_context))
+
     # Extract RAG context if present
     if "__rag_context" in tool_results:
         rag_context = tool_results["__rag_context"].get("result", "")
@@ -293,6 +300,18 @@ def summarize_results(user_query, tool_results, conversation_history="", chart_c
             "6. NEVER say 'chart shown above' or '[Insert chart here]' or 'here is a diagram'. "
             "The actual artifact must be present verbatim.\n"
             "7. After the chart, add 2-3 bullet points describing key patterns from the data."
+        )
+
+    # Inject variance analysis for multi-metric reports
+    if variance_context:
+        system_parts.append(
+            "VARIANCE ANALYSIS (computed from the data — use these exact figures in your management summary):\n"
+            "\n"
+            + variance_context + "\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Use the variance figures above to highlight key movements in the data.\n"
+            "2. Call out material variances explicitly: largest increases, largest decreases, and overall trend direction.\n"
+            "3. Do NOT invent variance figures — use ONLY the values provided above.\n"
         )
     elif chart_config and isinstance(chart_config, dict):
         # Fallback: planner provided config but no raw markdown was generated

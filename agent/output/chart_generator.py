@@ -13,17 +13,18 @@ Adheres to HR AI Agent Chart Guidelines:
   • Dual Format: raw data table always accompanies chart
   • Accessibility: color-blind friendly palette + alt-text
 
-PATCH 2026-06-19: Fixed aggregated data charting + robust DAB response format handling.
-PATCH 2026-06-22: Fixed ylabel for pre-aggregated hist data; improved pre-aggregation detection.
-PATCH 2026-06-23: Fixed Mermaid quoting (x-axis, title, y-axis), pie slice limits, case-sensitivity in column picking, line chart auto-mode, and fallback table preservation.
-PATCH 2026-06-26: Added y_label parameter to generate_chart() and sub-generators for executor post-binning sync compatibility.
+Fixed aggregated data charting + robust DAB response format handling.
+Fixed ylabel for pre-aggregated hist data; improved pre-aggregation detection.
+Fixed Mermaid quoting (x-axis, title, y-axis), pie slice limits, case-sensitivity in column picking, line chart auto-mode, and fallback table preservation.
+Added y_label parameter to generate_chart() and sub-generators for executor post-binning sync compatibility.
 """
 import json
 import os
 import time
 import base64
 import logging
-from typing import List, Dict, Optional, Literal, Tuple
+import math
+from typing import List, Dict, Optional, Literal, Tuple, Any
 
 import pandas as pd
 import matplotlib
@@ -66,6 +67,74 @@ PRE_AGGREGATED_CATEGORY_PATTERNS = {
     "department", "job_title", "status", "gender", "location", "leave_type",
     "hire_year", "hire_month", "hire_quarter", "year", "month", "quarter"
 }
+
+# Columns that should remain categorical even if they look numeric.
+# Used by _pick_columns() and chart renderers to avoid coercing
+# categorical/period/ID/text columns to numeric, which would corrupt
+# x-axis labels and produce "nan" in charts.
+NON_NUMERIC_COLUMN_PATTERNS = {
+    # Time / period columns
+    "poper", "period", "month", "year", "quarter", "week", "day", "date",
+    # ID / key columns
+    "id", "code", "key", "no", "num", "uuid",
+    # Common categorical / text columns
+    "name", "customer_name", "vendor_name", "employee_name", "description",
+    "text", "comment", "address", "city", "country", "state", "region",
+    "status", "type", "category", "department", "job_title", "location",
+    "email", "phone", "url", "link", "image", "file", "path",
+}
+
+
+def _is_string_like_dtype(dtype: Any) -> bool:
+    """Check if a pandas dtype should be treated as string-like for coercion.
+
+    Covers both legacy ``object`` and modern pandas ``StringDtype``.
+    ``StringDtype`` can appear as ``dtype.name == "string"`` or ``"str"``
+    depending on pandas / pyarrow availability, so both are accepted.
+    """
+    if dtype == object:
+        return True
+    if hasattr(dtype, "name"):
+        name = dtype.name
+        if name in ("string", "str"):
+            return True
+    return False
+
+
+def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> None:
+    """Coerce string-like columns in-place to numeric where possible.
+
+    HANA and some DAB responses may serialize numbers as strings or StringDtype.
+    Non-convertible values become NaN via errors='coerce'.
+    """
+    for col in cols:
+        if col not in df.columns:
+            continue
+        if _is_string_like_dtype(df[col].dtype):
+            try:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            except (ValueError, TypeError):
+                pass
+
+
+def _sanitize_value_for_hash(value: Any) -> Any:
+    """Convert a value to a hashable, comparable form for deduplication."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return tuple(_sanitize_value_for_hash(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (str(k), _sanitize_value_for_hash(v))
+            for k, v in value.items()
+        ))
+    return str(value)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -117,7 +186,23 @@ def extract_chartable_data(tool_results: Dict) -> List[Dict]:
                 continue
             logger.info("CHART_DEBUG_EXTRACT: found %d rows, cols=%s", 
                        len(extracted), list(extracted[0].keys()) if extracted else [])
-            return extracted
+            # ── Deduplicate exact duplicate rows (preserve first occurrence order) ──
+            seen: set = set()
+            deduped: List[Dict[str, Any]] = []
+            for row in extracted:
+                key = tuple(sorted(
+                    (str(k), _sanitize_value_for_hash(v))
+                    for k, v in row.items()
+                ))
+                if key not in seen:
+                    seen.add(key)
+                    deduped.append(row)
+            if len(deduped) < len(extracted):
+                logger.warning(
+                    "CHART_DEBUG_EXTRACT: deduplicated %d rows to %d",
+                    len(extracted), len(deduped)
+                )
+            return deduped
 
         # Legacy fallback paths
         if isinstance(raw, str):
@@ -191,6 +276,15 @@ def _pick_columns(data: List[Dict], chart_type: str) -> tuple[Optional[str], Opt
 
     df = pd.DataFrame(data)
     all_cols = list(df.columns)
+
+    # Only coerce columns that are not known categorical/period/ID columns.
+    # Coercing period columns like POPER to numeric breaks x-axis detection.
+    skip_coerce = {
+        c for c in all_cols
+        if c.lower().strip() in NON_NUMERIC_COLUMN_PATTERNS
+    }
+    _coerce_numeric(df, [c for c in all_cols if c not in skip_coerce])
+
     logger.info("CHART_DEBUG_PICK: columns=%s", all_cols)
 
     # Check for pre-aggregated data pattern
@@ -221,9 +315,9 @@ def _pick_columns(data: List[Dict], chart_type: str) -> tuple[Optional[str], Opt
     # Heuristic for 2-column data where one name suggests aggregation
     if len(all_cols) == 2:
         c0, c1 = all_cols[0], all_cols[1]
-        if any(kw in c0.lower() for kw in ("count", "total", "sum", "avg", "average")):
+        if any(kw in c0.lower() for kw in ("count", "total", "sum", "avg", "average", "revenue", "expense", "profit", "amount", "value")):
             return c1, c0, True, None
-        if any(kw in c1.lower() for kw in ("count", "total", "sum", "avg", "average")):
+        if any(kw in c1.lower() for kw in ("count", "total", "sum", "avg", "average", "revenue", "expense", "profit", "amount", "value")):
             return c0, c1, True, None
 
     # Standard classification
@@ -238,10 +332,25 @@ def _pick_columns(data: List[Dict], chart_type: str) -> tuple[Optional[str], Opt
     if not x_col and categorical_cols:
         x_col = categorical_cols[0]
 
-    preferred_num = ["count", "total", "sum", "avg", "salary", "age", "leave_balance", "turnover_rate"]
+    preferred_num = ["count", "total", "sum", "avg", "salary", "age", "leave_balance", "turnover_rate", "revenue", "expense", "profit", "ebitda", "net_profit", "amount", "value", "balance", "quantity", "rate", "percentage", "margin"]
     y_col = next((nc for nc in numeric_cols if nc.lower() in preferred_num), None)
     if not y_col and numeric_cols:
         y_col = numeric_cols[0]
+
+    # Final fallback: if no numeric column detected yet, try aggressive coercion on remaining columns
+    if not y_col and not numeric_cols:
+        for c in all_cols:
+            if c == x_col:
+                continue
+            try:
+                coerced = pd.to_numeric(df[c], errors="coerce")
+                if coerced.notna().any():
+                    df[c] = coerced
+                    y_col = c
+                    logger.info("CHART_DEBUG_PICK: fallback coercion found numeric column=%s", c)
+                    break
+            except (ValueError, TypeError):
+                continue
 
     logger.info("CHART_DEBUG_PICK: standard x=%s y=%s", x_col, y_col)
     return x_col, y_col, False, None
@@ -362,6 +471,14 @@ def generate_mermaid_chart(
         return ""
 
     df = pd.DataFrame(data)
+    all_cols = list(df.columns)
+
+    skip_coerce = {
+        c for c in all_cols
+        if c.lower().strip() in NON_NUMERIC_COLUMN_PATTERNS
+    }
+    _coerce_numeric(df, [c for c in all_cols if c not in skip_coerce])
+
     picked_x, picked_y, _, series_col = _pick_columns(data, chart_type)
     # If explicit x_column/y_column doesn't exist in binned data, fall back to auto-detected
     x_col = x_column if x_column and x_column in df.columns else picked_x
@@ -394,9 +511,13 @@ def generate_mermaid_chart(
         for _, row in df.iterrows():
             label = _escape_mermaid(str(row.get(x_col, "Unknown")))
             val = row.get(y_col, 0) if y_col and y_col in df.columns else 0
-            if val <= 0:
+            try:
+                val_f = float(val)
+            except (TypeError, ValueError):
+                val_f = 0
+            if val_f <= 0:
                 continue
-            lines.append(f'    "{label}" : {val}')
+            lines.append(f'    "{label}" : {val_f}')
         if len(lines) <= 3:
             logger.warning("CHART_DEBUG_MERMAID: pie chart has no valid slices, falling back to bar")
             return generate_mermaid_chart(data, "bar", x_column, y_column, title, y_label=y_label, include_table=include_table)
@@ -416,9 +537,22 @@ def generate_mermaid_chart(
             values = [str(v) for v in df[y_col].tolist()]
             if pd.api.types.is_numeric_dtype(df[y_col]):
                 y_max = df[y_col].max()
-                max_val = max(1, int(y_max)) if pd.notna(y_max) else 1
+                if pd.notna(y_max):
+                    max_val = max(1, math.ceil(float(y_max)))
+                else:
+                    max_val = 1
             else:
-                max_val = max(1, len(df))
+                # Fallback: try coercing y_col to numeric if it wasn't already.
+                # This handles cases where upstream coercion missed the column.
+                try:
+                    coerced_y = pd.to_numeric(df[y_col], errors="coerce")
+                    if coerced_y.notna().any():
+                        y_max = coerced_y.max()
+                        max_val = max(1, math.ceil(float(y_max))) if pd.notna(y_max) else 1
+                    else:
+                        max_val = max(1, len(df))
+                except (ValueError, TypeError):
+                    max_val = max(1, len(df))
             y_label_text = _escape_mermaid(y_label) if y_label else _escape_mermaid(_humanize_y_label(y_col))
             lines.append(f'    y-axis "{y_label_text}" 0 --> {max_val}')
             if chart_type == "line":
@@ -455,6 +589,19 @@ def _apply_colorblind_palette(ax, chart_type: str, num_colors: int = 1):
     if chart_type == "pie":
         return colors
     return colors
+
+
+def _safe_sort_numeric(df: pd.DataFrame, by: str, ascending: bool = True) -> pd.DataFrame:
+    """Sort df by column, coercing to numeric first to avoid lexicographic sort on string numbers."""
+    if by not in df.columns:
+        return df
+    if not pd.api.types.is_numeric_dtype(df[by]):
+        try:
+            numeric_series = pd.to_numeric(df[by], errors="coerce")
+        except (ValueError, TypeError):
+            return df
+        return df.assign(_sort_key=numeric_series).sort_values(by="_sort_key", ascending=ascending).drop(columns=["_sort_key"])
+    return df.sort_values(by=by, ascending=ascending)
 
 
 def _composite_x_labels(df: pd.DataFrame, x_col: str, series_col: Optional[str]) -> pd.DataFrame:
@@ -580,6 +727,14 @@ def generate_matplotlib_chart(
         return ""
 
     df = pd.DataFrame(data)
+    all_cols = list(df.columns)
+
+    skip_coerce = {
+        c for c in all_cols
+        if c.lower().strip() in NON_NUMERIC_COLUMN_PATTERNS
+    }
+    _coerce_numeric(df, [c for c in all_cols if c not in skip_coerce])
+
     picked_x, picked_y, is_pre_aggregated, series_col = _pick_columns(data, chart_type)
 
     # If explicit x_column/y_column doesn't exist in binned data, fall back to auto-detected
@@ -607,13 +762,13 @@ def generate_matplotlib_chart(
             if series_col:
                 # Multi-series grouped bar charts
                 df_labeled = _composite_x_labels(df, x_col, series_col)
-                df_labeled = df_labeled.sort_values(by=y_col, ascending=False).head(CHART_MAX_CATEGORIES)
+                df_labeled = _safe_sort_numeric(df_labeled, y_col, ascending=False).head(CHART_MAX_CATEGORIES)
                 colors = _apply_colorblind_palette(ax, "bar", len(df_labeled))
                 df_labeled.plot(x="__x_label__", y=y_col, kind="bar", ax=ax, color=colors[0], legend=False)
                 ax.set_xlabel("Category")
                 ax.set_ylabel(y_label if y_label else _humanize_y_label(y_col))
             elif is_pre_aggregated:
-                plot_df = df.sort_values(by=y_col, ascending=False).head(CHART_MAX_CATEGORIES)
+                plot_df = _safe_sort_numeric(df, y_col, ascending=False).head(CHART_MAX_CATEGORIES)
                 colors = _apply_colorblind_palette(ax, "bar", len(plot_df))
                 plot_df.plot(x=x_col, y=y_col, kind="bar", ax=ax, color=colors[0], legend=False)
                 ax.set_xlabel(x_col.replace("_", " ").title())
@@ -631,13 +786,13 @@ def generate_matplotlib_chart(
             if series_col:
                 # Multi-series grouped bar charts (horizontal)
                 df_labeled = _composite_x_labels(df, x_col, series_col)
-                df_labeled = df_labeled.sort_values(by=y_col, ascending=True).head(CHART_MAX_CATEGORIES)
+                df_labeled = _safe_sort_numeric(df_labeled, y_col, ascending=True).head(CHART_MAX_CATEGORIES)
                 colors = _apply_colorblind_palette(ax, "barh", len(df_labeled))
                 df_labeled.plot(x="__x_label__", y=y_col, kind="barh", ax=ax, color=colors[0], legend=False)
                 ax.set_xlabel("Category")
                 ax.set_ylabel(y_col.replace("_", " ").title() if y_col else "Count")
             elif is_pre_aggregated:
-                plot_df = df.sort_values(by=y_col, ascending=True).head(CHART_MAX_CATEGORIES)
+                plot_df = _safe_sort_numeric(df, y_col, ascending=True).head(CHART_MAX_CATEGORIES)
                 colors = _apply_colorblind_palette(ax, "barh", len(plot_df))
                 plot_df.plot(x=x_col, y=y_col, kind="barh", ax=ax, color=colors[0], legend=False)
                 ax.set_xlabel(y_label if y_label else _humanize_y_label(y_col))
@@ -658,7 +813,7 @@ def generate_matplotlib_chart(
             elif is_pre_aggregated:
                 plot_df = df.head(CHART_PIE_MAX_SLICES)
                 if len(df) > CHART_PIE_MAX_SLICES:
-                    top = df.nlargest(CHART_PIE_MAX_SLICES - 1, y_col)
+                    top = _safe_sort_numeric(df, y_col, ascending=False).nlargest(CHART_PIE_MAX_SLICES - 1, y_col)
                     other_val = df.iloc[CHART_PIE_MAX_SLICES - 1:][y_col].sum()
                     other_row = pd.DataFrame([{x_col: "Other", y_col: other_val}])
                     plot_df = pd.concat([top, other_row], ignore_index=True)
@@ -680,7 +835,7 @@ def generate_matplotlib_chart(
             if series_col:
                 # Multi-series hist: composite labels
                 df_labeled = _composite_x_labels(df, x_col, series_col)
-                df_labeled = df_labeled.sort_values(by=y_col).head(CHART_MAX_CATEGORIES)
+                df_labeled = _safe_sort_numeric(df_labeled, y_col).head(CHART_MAX_CATEGORIES)
                 colors = _apply_colorblind_palette(ax, "bar", len(df_labeled))
                 df_labeled.plot(x="__x_label__", y=y_col, kind="bar", ax=ax, color=colors[0], legend=False)
                 ax.set_xlabel("Category")
@@ -782,11 +937,6 @@ def generate_matplotlib_chart(
         if trend_line and chart_type == "line" and x_col and y_col and y_col in df.columns:
             _add_trend_line(ax, df, x_col, y_col)
 
-        else:
-            logger.warning("Unknown chart type: %s", chart_type)
-            plt.close(fig)
-            return ""
-
         ax.set_title(chart_title)
         plt.tight_layout()
 
@@ -823,6 +973,138 @@ def generate_matplotlib_chart(
         return ""
 
 
+def _detect_wide_format_metrics(data: List[Dict], requested_metrics: Optional[List[str]]) -> List[str]:
+    """Detect metric columns from wide-format data.
+
+    Wide format: one row per time period, multiple numeric metric columns.
+    Returns list of metric column names to chart.
+    """
+    if not data or not isinstance(data[0], dict):
+        return []
+
+    df = pd.DataFrame(data)
+    all_cols = list(df.columns)
+
+    # If caller provided explicit metrics, intersect with available columns
+    if requested_metrics:
+        available = []
+        for m in requested_metrics:
+            # Try exact match first, then case-insensitive
+            if m in all_cols:
+                available.append(m)
+            else:
+                lower_map = {c.lower(): c for c in all_cols}
+                if m.lower() in lower_map:
+                    available.append(lower_map[m.lower()])
+        return available
+
+    # Auto-detect: find numeric columns that look like metrics
+    exclude = {"year", "month", "quarter", "period", "poper", "bukrs", "bukrs"}
+    _coerce_numeric(df, [c for c in all_cols if c.lower() not in exclude])
+    numeric_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df[c])]
+    metric_cols = [c for c in numeric_cols if c.lower() not in exclude]
+    return metric_cols
+
+
+def generate_multi_series_chart(
+    data: List[Dict],
+    chart_type: str,
+    x_column: Optional[str] = None,
+    title: Optional[str] = None,
+    y_label: Optional[str] = None,
+    metrics: Optional[List[str]] = None,
+    return_mode: Literal["url", "base64", "path"] = "url",
+    include_table: bool = True,
+    trend_line: bool = False,
+) -> str:
+    """Generate a multi-series matplotlib chart from wide-format financial data.
+
+    Expected format: [{POPER, REVENUE, GROSS_PROFIT, EBITDA, NET_PROFIT}, ...]
+    Each metric becomes a separate line/bar with legend.
+    """
+    if not data or not isinstance(data[0], dict):
+        logger.warning("CHART_DEBUG_MULTI: no data")
+        return ""
+
+    df = pd.DataFrame(data)
+    all_cols = list(df.columns)
+
+    # Detect x-axis column
+    x_col = x_column
+    if not x_col or x_col not in df.columns:
+        preferred_x = ["poper", "month", "period", "year", "quarter"]
+        for px in preferred_x:
+            if px in all_cols:
+                x_col = px
+                break
+        if not x_col:
+            x_col = all_cols[0]
+
+    # Detect metric columns
+    metric_cols = _detect_wide_format_metrics(data, metrics)
+    if not metric_cols:
+        logger.warning("CHART_DEBUG_MULTI: no metric columns found in %s", all_cols)
+        return ""
+
+    # Coerce metric columns to numeric
+    _coerce_numeric(df, metric_cols)
+
+    chart_title = title or f"{x_col.replace('_', ' ').title()} Financial Metrics"
+    fig = None
+    try:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        x_values = df[x_col].tolist()
+
+        # Plot each metric as a separate line
+        for i, metric in enumerate(metric_cols):
+            color = COLORBLIND_PALETTE[i % len(COLORBLIND_PALETTE)]
+            label = metric.replace("_", " ").title()
+            ax.plot(x_values, df[metric], marker="o", color=color, label=label, linewidth=2)
+
+            if trend_line:
+                try:
+                    clean_x = np.arange(len(df))
+                    clean_y = df[metric].dropna()
+                    if len(clean_y) >= 2:
+                        coeffs = np.polyfit(clean_x, clean_y, 1)
+                        trend = coeffs[0] * clean_x + coeffs[1]
+                        ax.plot(x_values, trend, linestyle="--", color=color, linewidth=1.5, alpha=0.7)
+                except Exception as e:
+                    logger.debug("CHART_DEBUG_MULTI: trend line failed for %s: %s", metric, e)
+
+        ax.set_title(chart_title, fontsize=14, fontweight="bold")
+        ax.set_xlabel(x_col.replace("_", " ").title())
+        ax.set_ylabel(y_label or "Value")
+        ax.legend(title="Metrics", loc="best")
+        ax.grid(True, alpha=0.3)
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right")
+        plt.tight_layout()
+
+        filename = f"chart_{int(time.time())}_multi.png"
+        out_path = os.path.join(CHART_OUTPUT_DIR, filename)
+        plt.savefig(out_path, dpi=CHART_DPI, bbox_inches="tight")
+        plt.close(fig)
+
+        base = CHART_BASE_URL.rstrip("/")
+        md_parts = [f"![Chart]({base}/charts/{filename})"]
+
+        if include_table:
+            table_md = generate_data_table(data)
+            if table_md:
+                md_parts.append("")
+                md_parts.append(table_md)
+
+        result = "\n".join(md_parts)
+        logger.info("CHART_DEBUG_MULTI: success, markdown_len=%d", len(result))
+        return result
+
+    except Exception as e:
+        logger.error("CHART_DEBUG_MULTI: generation failed: %s", e, exc_info=True)
+        if fig is not None:
+            plt.close(fig)
+        return ""
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # UNIFIED ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -841,6 +1123,9 @@ def generate_chart(
     gauge_max: Optional[float] = None,
     gauge_threshold: Optional[float] = None,
     trend_line: bool = False,
+    _retry_count: int = 0,
+    multi_series: bool = False,
+    metrics: Optional[List[str]] = None,
 ) -> str:
     """
     Generate a chart in the configured mode.
@@ -886,12 +1171,48 @@ def generate_chart(
     if chart_type == "gauge":
         mode = "matplotlib"
 
+    # Multi-series reports require matplotlib for proper legend/scale handling.
+    if multi_series and mode != "base64":
+        mode = "matplotlib"
+
     if mode == "mermaid":
         result = generate_mermaid_chart(data, chart_type, x_column, y_column, title, y_label=y_label, include_table=include_table)
-    elif mode == "base64":
-        result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="base64", include_table=include_table, gauge_min=gauge_min, gauge_max=gauge_max, gauge_threshold=gauge_threshold, trend_line=trend_line)
+    elif mode == "base64" or multi_series:
+        result = generate_multi_series_chart(
+            data=data,
+            chart_type=chart_type,
+            x_column=x_column,
+            title=title,
+            y_label=y_label,
+            metrics=metrics,
+            return_mode="base64" if mode == "base64" else "url",
+            include_table=include_table,
+            trend_line=trend_line,
+        )
     else:
         result = generate_matplotlib_chart(data, chart_type, x_column, y_column, title, y_label=y_label, return_mode="url", include_table=include_table, gauge_min=gauge_min, gauge_max=gauge_max, gauge_threshold=gauge_threshold, trend_line=trend_line)
+
+    # Defense-in-depth: if chart generation returned empty or fell back to Count-only,
+    # retry once with fully auto-detected columns from the data itself.
+    if not result and data and _retry_count < 1:
+        logger.info("CHART_DEBUG_GENERATE: empty result, retrying with auto-detected columns")
+        retry_type = chart_type if chart_type != "hist" else "bar"
+        result = generate_chart(
+            data=data,
+            chart_type=retry_type,
+            x_column=None,
+            y_column=None,
+            title=title,
+            y_label=y_label,
+            mode=mode,
+            auth_role=auth_role,
+            include_table=include_table,
+            gauge_min=gauge_min,
+            gauge_max=gauge_max,
+            gauge_threshold=gauge_threshold,
+            trend_line=trend_line,
+            _retry_count=_retry_count + 1,
+        )
 
     logger.info("CHART_DEBUG_GENERATE: result_len=%d empty=%s", len(result), result == "")
     return result

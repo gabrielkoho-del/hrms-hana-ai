@@ -74,8 +74,8 @@ def build_export_metadata(
         "Chart Type": chart_config.get("type", "bar") if chart_config else "none",
         "X Column": chart_config.get("x_column", "") if chart_config else "",
         "Y Column": chart_config.get("y_column", "") if chart_config else "",
-        "AI Version": "HRMS Agent 1.2",
-        "Source": "DAB 2.0.8 / SQL Server",
+        "AI Version": "Prototype Agent 0.1",
+        "Source": "hana-mcp-server",
     }
 
     if tool_calls_made:

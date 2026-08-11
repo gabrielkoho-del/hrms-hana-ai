@@ -177,17 +177,29 @@ This replaces the previous hardcoded `_HANA_FINANCE_TABLES` set with a dynamic, 
 | Fallback | `config/finance_config.yaml` → `finance_table_names` |
 | Config location | `config/finance_config.yaml` |
 
-##### Finance Keyword Configuration (NEW)
+##### Finance Keyword Configuration (NEW — Hybrid)
 
-Finance intent keywords are loaded from `config/finance_config.yaml` at import time, not hardcoded in source:
+Finance metric extraction uses a **two-tier hybrid approach** to balance latency and accuracy:
+
+| Tier | Mechanism | Latency | Accuracy |
+|------|-----------|---------|----------|
+| **Fast gate** | Regex word-boundary matching against curated list, longest-match-first | ~0ms | Medium |
+| **LLM fallback** | Structured JSON extraction via `call_llm(json_mode=True)` | ~200–500ms | High |
 
 | Config Key | Purpose | Default |
 |------------|---------|---------|
-| `finance_keywords` | Substring-matched terms for fast-path intent detection | Narrowed list (see config file) |
+| `finance_keywords` | Fast-gate terms for metric extraction | Narrowed list (see config file) |
 | `finance_table_prefixes` | HANA table name prefixes for dynamic discovery | `FAGL`, `BKPF`, `BSEG`, `SKA`, `CSK`, `T001`, `TCUR` |
 | `finance_table_names` | Fallback tables if schema discovery fails | `FAGLFLEXA`, `BKPF`, `BSEG`, `SKA1`, `SKAT`, `CSKS`, `CSKT`, `T001`, `TCURC`, `TCURR` |
 | `schema_discovery_tool` | HANA tool used for discovery | `hana_list_tables` |
 | `schema_cache_ttl_seconds` | How long to cache discovered tables | 3600 |
+
+**Decision logic:**
+1. Normalize query → SHA256 cache key
+2. Cache hit → return cached metrics
+3. Fast gate (regex `\b...\b`, sorted by length descending)
+4. Heuristic: if gate found 0 metrics but query has financial language, or found 1 but query mentions ≥2 distinct financial terms → LLM fallback
+5. Cache and return final result
 
 | Tool | Purpose | Parameters |
 |------|---------|------------|
@@ -301,6 +313,7 @@ Key features:
 - **Explicit chart type detection**: Detects "bar chart", "pie chart", "line graph" etc. from user query
 - **Export intent inference**: Detects "export", "download", "Excel" keywords for aggregate queries
 - **TTL cache**: Multi-tenant-safe schema formatting cache (5-min expiry, 100 entries)
+- **Hybrid metric extraction**: Fast regex gate + LLM fallback with TTL cache for financial multi-metric queries (e.g., "revenue, expense and profit by month")
 
 #### Stage 2: Execution
 
@@ -672,6 +685,8 @@ Two-layer defense:
 |------|------------|---------|
 | Greeting/smalltalk | **0** | Regex guard, zero cost |
 | Standard DB query | **3** | Intent + Plan + Summarize |
+| Financial multi-metric (cache cold) | **4** | + hybrid metric extraction (LLM fallback) |
+| Financial multi-metric (cache warm) | **3** | Fast gate + cache hit |
 | With conflict detection | **3–4** | + optional `detect_conflicts` |
 
 ### Model Context Window
@@ -789,6 +804,7 @@ This prevents the AI from hallucinating leave balances based on policy text. If 
 | `Session state` | Per-user | Every turn | In-memory only |
 | **Finance tables** | **Global** | **Startup (`initialize_finance_tables`)** | **1 hr (configurable)** |
 | **HANA Schema Registry** | **Per-tenant** | **Startup + background refresh** | **Configurable (default 1 hr)** |
+| **Metric extraction** | **Per-query** | **On hybrid extraction** | **5 min (TTL, 256 entries)** |
 
 ---
 

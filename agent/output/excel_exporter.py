@@ -454,8 +454,13 @@ def export_to_excel_with_chart(
             ws_summary.set_row(0, 32)
 
             # Subtitle / filter line
-            filter_text = metadata.get("filter", "Active Employees") if metadata else "Active Employees"
-            ws_summary.merge_range(1, 1, 1, 6, f"Generated: {generated_at}    |    Filter: {filter_text}", value_fmt)
+            filter_text = ""
+            if metadata:
+                filter_text = metadata.get("Filters Applied", "") or metadata.get("Entity", "") or ""
+            subtitle = f"Generated: {generated_at}"
+            if filter_text:
+                subtitle += f"    |    Filter: {filter_text}"
+            ws_summary.merge_range(1, 1, 1, 6, subtitle, value_fmt)
             ws_summary.set_row(1, 18)
 
             # Key Statistics block (rows 3-8, 0-based)
@@ -464,7 +469,7 @@ def export_to_excel_with_chart(
             ws_summary.set_row(stats_start, 22)
 
             stats = [
-                ("Total Employees", _sanitize_stat(total_y)),
+                (y_column.replace("_", " ").title() if y_column else "Total", _sanitize_stat(total_y)),
                 ("Distinct Categories", len(df_sorted)),
             ]
             # Largest / Smallest
