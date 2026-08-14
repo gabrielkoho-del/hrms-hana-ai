@@ -285,7 +285,7 @@ class DABClient:
 
         Follows the same MCP content unwrapping pattern as describe_entities.
         """
-        from agent.dab.dab_response import extract_items
+        from agent.data.response import extract_items
 
         unwrapped = self._unwrap_mcp_content(result)
         return extract_items(unwrapped)

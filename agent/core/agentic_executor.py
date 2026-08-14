@@ -38,9 +38,9 @@ from agent.summarizer.response_summarizer import summarize_results
 from agent.core.intent_classifier import classify_intent, IntentResult, _is_short_affirmative
 from agent.output.excel_exporter import export_to_excel, export_to_excel_with_chart
 from agent.integrations.dab_client import dab_manager, invoke_dab_tool_with_retry
-from agent.dab.dab_response import extract_items, extract_payload, is_dab_error
+from agent.data.response import extract_items, extract_payload, is_dab_error
 from agent.dab.validation import validate_dab_args
-from agent.dab.metrics import (
+from agent.data.metrics import (
     record_dab_tool_call, record_dab_error,
     record_chart_generated
 )

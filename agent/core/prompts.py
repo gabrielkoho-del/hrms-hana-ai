@@ -1,9 +1,12 @@
 """System prompt builders for DAB native tool calling and JSON fallback modes."""
-from typing import Dict, List, Optional, Any
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 from agent.config import DEFAULT_MAX_ROWS, LARGE_RESULT_THRESHOLD, UNLIMITED_ROWS
+from agent.core.utils import schema_cache
 
-logger = None  # logging.getLogger("hr_agent") — imported in tool_planner.py
+logger = logging.getLogger("hr_agent")
 
 
 def build_tone_aware_guidance(tone_context: Dict) -> str:
@@ -270,6 +273,18 @@ def build_tool_calling_system_prompt(
         "- Personal queries (my leave, my salary): fetch DB record FIRST. Policy is REFERENCE ONLY. Never substitute policy for personal data.",
         "- Self-referential: filter by auth_context email/emp_id. NEVER query others if read:self.",
         "- If personal record is 0 rows: state 'I checked your records and do not see [X] on file.' Then MAY cite general policy as reference only.",
+        "",
+        "TMS OVERTIME / ABSENCE PATTERN (V_TMS_OVERTIME + V_EMP):",
+        "When the user asks about absence days, absentees, attendance summary, or overtime-related employee lists from V_TMS_OVERTIME, use this exact two-step pattern:",
+        "Step 1: Call aggregate_records on entity=V_TMS_OVERTIME with function='count', field='Indicator', groupby=['employee_no'], and filter=\"Indicator ne null\". This returns one row per employee with their absent-day count. Use first='-1' only if the user explicitly asks for all employees; otherwise use a reasonable default like first='50'.",
+        "Step 2: From the aggregate result, extract the employee_no values and call read_records on entity=V_EMP with filter=\"EMPLOYEE_NO in (<comma-separated list>)\" and a select list of presentable fields such as EMPLOYEE_NO, EMPLOYEE_NAME, GENDER, DEPARTMENT_CODE, POSITION_CODE, DATE_JOINED. If the employee list is long, paginate with first=50 and provide the after cursor for continuation.",
+        "Step 3: Join the two result sets in Python using employee_no as the key. Build a hash map from the V_EMP results, then annotate each V_TMS_OVERTIME aggregate row with employee name and department. This is an O(n) in-memory join with negligible memory cost.",
+        "RULES FOR THIS PATTERN:",
+        "- NEVER call read_records on V_TMS_OVERTIME without a filter on actual_date or employee_no; it is a large daily attendance view and will return too many rows.",
+        "- NEVER return raw V_TMS_OVERTIME daily rows to the user for absence summary questions; always aggregate first.",
+        "- The Indicator column contains 'Absent' when the employee was absent; count non-null Indicator values to compute absent days.",
+        "- Use actual_date for date filtering if the user specifies a period (e.g., actual_date ge 2025-01-01 and actual_date le 2025-12-31).",
+        "- Do NOT attempt to join V_TMS_OVERTIME and V_EMP inside the database; do the join in Python after both tool calls return.",
     ])
 
     return "\n".join(parts)
@@ -311,3 +326,247 @@ def _build_hana_prompt_block(
         "- MULTI-METRIC FINANCIAL REPORTS: When the user asks for multiple metrics (e.g., Revenue, Gross Profit, EBITDA, Net Profit) in one report, return a WIDE format result with one row per time period and one column per metric. Example: SELECT POPER, SUM(CASE WHEN RACCT IN ('800000','805000') THEN -HSL ELSE 0 END) AS REVENUE, SUM(CASE WHEN RACCT BETWEEN '420000' AND '480000' THEN HSL ELSE 0 END) AS GROSS_PROFIT, ... FROM DBADMIN.FAGLFLEXA WHERE GJAHR = '2025' GROUP BY POPER ORDER BY POPER. Do NOT return separate result sets for each metric. Include a METRIC column only if stacking vertically; prefer horizontal wide format for charts.",
     ])
     return schema_lines
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SCHEMA FORMATTING — selective enrichment + token pruning
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Config knobs for schema formatting
+MAX_ENTITIES = 20
+MAX_FIELDS_PER_ENTITY = 25
+MAX_DISTINCT_INLINE = 10
+MAX_DISTINCT_VALUES = 10
+TOKEN_BUDGET = 5000  # Schema token budget for planner prompt
+
+
+def _format_field(field: Dict, include_distinct: bool = True) -> str:
+    """Format a single field: name:type or name:type{val1,val2}."""
+    fname = field.get("name", "")
+    ftype = field.get("type", "")
+    if not fname:
+        return ""
+
+    parts = [f"{fname}:{ftype}"]
+
+    if include_distinct:
+        distinct = field.get("distinct_values")
+        if isinstance(distinct, (list, tuple)) and 0 < len(distinct) <= MAX_DISTINCT_INLINE:
+            vals = ",".join(str(v) for v in distinct[:MAX_DISTINCT_VALUES])
+            parts.append(f"{{{vals}}}")
+
+    return "".join(parts)
+
+
+def _format_entity(entity_name: str, entity: Dict, include_desc: bool = True, include_distinct: bool = True) -> str:
+    """Format one entity line: Entity -> field1:type, field2:type{val1,val2}, ..."""
+    fields = entity.get("fields", entity.get("columns", [])) if isinstance(entity, dict) else []
+    field_strs = []
+    for f in fields[:MAX_FIELDS_PER_ENTITY]:
+        if isinstance(f, dict):
+            s = _format_field(f, include_distinct=include_distinct)
+            if s:
+                field_strs.append(s)
+        else:
+            field_strs.append(str(f))
+    if len(fields) > MAX_FIELDS_PER_ENTITY:
+        field_strs.append("...")
+
+    line = f"  {entity_name} -> {', '.join(field_strs)}"
+    if include_desc:
+        desc = entity.get("description", "") if isinstance(entity, dict) else ""
+        if desc and len(desc) <= 60:
+            line += f"  # {desc}"
+    return line
+
+
+def _format_schema_with_selected_fields(schema: Dict, selected_fields: List[str]) -> str:
+    """Format schema showing only selected fields + count of remaining fields per entity."""
+    lines = ["Entities:"]
+    for entity_name, entity in schema.items():
+        if not isinstance(entity, dict):
+            continue
+        fields = entity.get("fields", entity.get("columns", []))
+        field_strs = []
+        remaining = []
+        for f in fields:
+            if isinstance(f, dict):
+                fname = f.get("name", "")
+                if fname in selected_fields:
+                    s = _format_field(f, include_distinct=True)
+                    if s:
+                        field_strs.append(s)
+                else:
+                    remaining.append(fname)
+            else:
+                remaining.append(str(f))
+
+        if remaining:
+            field_strs.append(f"... ({len(remaining)} more: {', '.join(remaining[:5])}{'...' if len(remaining) > 5 else ''})")
+
+        line = f"  {entity_name} -> {', '.join(field_strs)}"
+        desc = entity.get("description", "")
+        if desc and len(desc) <= 60:
+            line += f"  # {desc}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_schema_for_prompt(schema: Dict, token_budget: int = TOKEN_BUDGET, user_query: str = "") -> str:
+    """Production-grade schema formatter with progressive token pruning."""
+    if not schema:
+        return "Database schema: unavailable"
+
+    entities = [(name, ent) for name, ent in schema.items() if isinstance(ent, dict)]
+    entities = entities[:MAX_ENTITIES]
+
+    def _build(include_desc: bool, include_distinct: bool) -> str:
+        lines = ["Entities:"]
+        for name, ent in entities:
+            lines.append(_format_entity(name, ent, include_desc, include_distinct))
+        return "\n".join(lines)
+
+    # Try progressively leaner formats until under token budget
+    for desc, distinct in [(True, True), (False, True), (False, False)]:
+        text = _build(desc, distinct)
+        if len(text) // 3 <= token_budget:  # rough token estimate
+            return text
+
+    # If still over budget, truncate entities aggressively
+    while len(entities) > 3 and len(_build(False, False)) // 3 > token_budget:
+        entities = entities[: len(entities) - 1]
+
+    result = _build(False, False)
+    if len(result) // 3 > token_budget:
+        logger.warning(
+            "Schema token budget exhausted even after aggressive pruning. "
+            "Consider splitting schema across multiple calls."
+        )
+    return result
+
+
+async def format_schema_for_prompt_cached(
+    schema: Dict, tenant_id: str = "default", user_query: str = ""
+) -> str:
+    """Multi-tenant-aware cached schema formatter with 5-min TTL."""
+    if not schema:
+        return "Database schema: unavailable"
+
+    total_fields = sum(
+        len(e.get("fields", e.get("columns", [])))
+        for e in schema.values() if isinstance(e, dict)
+    )
+
+    # For large schemas with user query, use semantic field retrieval
+    if user_query and total_fields > 25:
+        try:
+            relevant = await _retrieve_relevant_fields(
+                user_query, schema, tenant_id=tenant_id, top_k=MAX_FIELDS_PER_ENTITY
+            )
+            selected_fields = [r["name"] for r in relevant if "name" in r]
+            if selected_fields:
+                formatted = _format_schema_with_selected_fields(schema, selected_fields)
+                logger.info(
+                    "Schema formatted with semantic retrieval: %d/%d fields selected",
+                    len(selected_fields), total_fields
+                )
+                return formatted
+        except Exception as e:
+            logger.warning("Semantic schema retrieval failed: %s. Falling back to full schema.", e)
+
+    # Cache key excludes user_query for base schema; semantic retrieval is fast
+    base_key = f"{tenant_id}:{json.dumps(schema, sort_keys=True, default=str)}"
+    cached = schema_cache.get(base_key)
+    if cached is not None:
+        return cached
+
+    formatted = format_schema_for_prompt(schema)
+    schema_cache.set(base_key, formatted)
+    return formatted
+
+
+async def _retrieve_relevant_fields(
+    user_query: str,
+    schema: Dict,
+    tenant_id: str = "default",
+    top_k: int = 8,
+) -> List[Dict]:
+    """Retrieve relevant fields using embedding-based semantic retrieval."""
+    total_fields = sum(
+        len(e.get("fields", e.get("columns", [])))
+        for e in schema.values() if isinstance(e, dict)
+    )
+
+    # For small schemas, return all fields (no retrieval needed)
+    if total_fields <= 25:
+        all_fields = []
+        for entity_name, entity in schema.items():
+            if not isinstance(entity, dict):
+                continue
+            for field in entity.get("fields", entity.get("columns", [])):
+                if isinstance(field, dict):
+                    all_fields.append({
+                        "entity": entity_name,
+                        "name": field.get("name", ""),
+                        "type": field.get("type", ""),
+                        "description": field.get("description", ""),
+                        "score": 1.0,
+                    })
+        return all_fields
+
+    # For large schemas, use embedding retrieval via schema_index
+    try:
+        from agent.integrations.schema_index import search_relevant_fields
+        return await search_relevant_fields(user_query, schema, tenant_id=tenant_id, top_k=top_k)
+    except Exception as e:
+        logger.warning("Embedding retrieval failed: %s. Returning full schema.", e)
+        # Degrade gracefully: return all fields
+        all_fields = []
+        for entity_name, entity in schema.items():
+            if not isinstance(entity, dict):
+                continue
+            for field in entity.get("fields", entity.get("columns", [])):
+                if isinstance(field, dict):
+                    all_fields.append({
+                        "entity": entity_name,
+                        "name": field.get("name", ""),
+                        "type": field.get("type", ""),
+                        "description": field.get("description", ""),
+                        "score": 1.0,
+                    })
+        return all_fields
+
+
+def build_user_context_rules(auth_context: Any) -> str:
+    """Build user context rules for prompt injection."""
+    if not auth_context or not auth_context.authenticated:
+        return ""
+
+    rules = []
+    if auth_context.email:
+        rules.append(
+            "- Your email identity is: EMAIL eq '" + auth_context.email + "'. "
+            "Use this value for filtering on the EMAIL field."
+        )
+    if auth_context.emp_id:
+        rules.append(
+            "- Your employee ID is: " + auth_context.emp_id + ". "
+            "For LOCALDEV tenant, use emp_id field. "
+            "For RDEMOROCKFORT tenant, use EMPLOYEE_NO field. "
+            "Both support leading zeros (e.g., '000024')."
+        )
+
+    if "read:all_employees" not in auth_context.permissions:
+        if "read:subordinates" in auth_context.permissions:
+            rules.append(
+                "- MANAGER ROLE: When querying employees, filter to subordinates only: "
+                "manager_id eq YOUR_EMP_ID. You may also include your own record."
+            )
+        elif "read:self" in auth_context.permissions:
+            rules.append(
+                "- EMPLOYEE ROLE (SELF-ONLY): You are STRICTLY LIMITED to querying ONLY the user's own profile. "
+                "ALL queries MUST include a self-filter using your email or emp_id. "
+                "NEVER query other employees' data. If the user asks about others, refuse and explain."
+            )
+
+    return "\n".join(rules)

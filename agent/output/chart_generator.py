@@ -32,7 +32,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from agent.dab.dab_response import extract_items
+from agent.data.response import extract_items
 
 logger = logging.getLogger("hr_agent")
 

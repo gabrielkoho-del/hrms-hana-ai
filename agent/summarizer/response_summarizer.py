@@ -5,7 +5,7 @@ from typing import Dict, Optional, List
 
 from agent.output.excel_exporter import export_to_excel
 from agent.integrations.llm_client import call_llm
-from agent.dab.dab_response import format_dab_items_context
+from agent.data.response import format_dab_items_context
 
 from agent.summarizer.prompt.registry import PERSONAL_DATA_CATEGORIES, ACTION_CATEGORIES, get_assist_suggestions
 from agent.summarizer.prompt.tone import build_tone_block
@@ -14,7 +14,7 @@ from agent.summarizer.prompt.data_rules import build_data_protocol
 from agent.summarizer.prompt.formatting import build_formatting_protocol, build_zero_row_guidance
 from agent.summarizer.prompt.export_guidance import build_export_aware_guidance
 from agent.summarizer.validators.conflict import detect_conflicts
-from agent.dab.dab_response import extract_items_with_meta
+from agent.data.response import extract_items_with_meta
 
 logger = logging.getLogger("hr_agent")
 

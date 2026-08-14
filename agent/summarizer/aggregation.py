@@ -1,7 +1,7 @@
 import json
 import logging
 
-from agent.dab.dab_response import extract_items_with_meta
+from agent.data.response import extract_items_with_meta
 
 logger = logging.getLogger("hr_agent")
 

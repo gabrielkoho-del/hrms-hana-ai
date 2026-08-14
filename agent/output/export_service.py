@@ -10,8 +10,8 @@ Encapsulates all Excel-export concerns:
 import logging
 from typing import Any, Dict, List, Optional
 
-from agent.dab.dab_response import extract_items
-from agent.dab.metrics import record_chart_generated
+from agent.data.response import extract_items
+from agent.data.metrics import record_chart_generated
 from agent.output.excel_exporter import export_to_excel, export_to_excel_with_chart
 from agent.auth.role_resolver import is_data_about_user
 

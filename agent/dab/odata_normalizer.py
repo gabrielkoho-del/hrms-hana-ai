@@ -21,7 +21,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from agent.dab.metrics import record_entity_normalized
+from agent.data.metrics import record_entity_normalized
 
 logger = logging.getLogger("hr_agent")
 

@@ -1,7 +1,10 @@
-"""agent/dab/dab_response.py
+"""agent/data/response.py
 
-Consolidated DAB/MCP response extraction utilities.
-Handles multiple response wrapper formats from Data API Builder MCP tools.
+Shared response extraction and normalization utilities.
+
+Handles multiple response wrapper formats from DAB and HANA MCP tools,
+converting them to a common list-of-dicts shape for downstream consumers
+(chart generator, export service, summarizer).
 """
 import json
 import logging
@@ -9,16 +12,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hr_agent")
 
-# Known DAB response keys that contain data
-_DAB_DATA_KEYS = ("result", "value", "items", "data", "records", "rows")
+# Known response keys that contain data
+_DATA_KEYS = ("result", "value", "items", "data", "records", "rows")
 
-# Keywords that indicate DAB error text
-_DAB_ERROR_KEYWORDS = ("not defined", "not found", "Invalid field", "EntityNotFound", "error", "failed")
+# Keywords that indicate error text
+_ERROR_KEYWORDS = ("not defined", "not found", "Invalid field", "EntityNotFound", "error", "failed")
 
 
 def extract_items(result: Any) -> List[Dict]:
     """
-    Extract a list of dict records from any DAB/MCP response format.
+    Extract a list of dict records from any MCP response format.
 
     Handles:
       - Direct list: [{"age": 25}, ...]
@@ -32,8 +35,8 @@ def extract_items(result: Any) -> List[Dict]:
     if isinstance(result, list):
         return [r for r in result if isinstance(r, dict)]
     if isinstance(result, dict):
-        # Try known DAB keys first
-        for key in _DAB_DATA_KEYS:
+        # Try known data keys first
+        for key in _DATA_KEYS:
             if key in result:
                 val = result[key]
                 if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
@@ -46,7 +49,7 @@ def extract_items(result: Any) -> List[Dict]:
             if isinstance(val, list) and len(val) > 0 and isinstance(val[0], dict):
                 return val
             if isinstance(val, dict):
-                for nested_key in _DAB_DATA_KEYS:
+                for nested_key in _DATA_KEYS:
                     if nested_key in val and isinstance(val[nested_key], list):
                         items = [r for r in val[nested_key] if isinstance(r, dict)]
                         if items:
@@ -62,13 +65,13 @@ def extract_items(result: Any) -> List[Dict]:
 
 def extract_payload(result: Any) -> Any:
     """
-    Unwrap MCP CallToolResult content wrapper to get the inner DAB payload.
+    Unwrap MCP CallToolResult content wrapper to get the inner payload.
 
     Handles:
-      - Direct DAB payload (no wrapper)
+      - Direct payload (no wrapper)
       - MCP wrapper: {"content": [{"type": "text", "text": "JSON"}], "isError": bool}
       - JSON-RPC error: {"error": {...}}
-      - DAB error in text content without isError flag
+      - Error text in content without isError flag
 
     Returns:
       - Parsed dict on success
@@ -96,7 +99,7 @@ def extract_payload(result: Any) -> Any:
             first = content[0]
             if isinstance(first, dict) and "text" in first:
                 return {"isError": True, "message": first["text"]}
-        return {"isError": True, "message": "Unknown DAB error"}
+        return {"isError": True, "message": "Unknown error"}
 
     # MCP content wrapper: unwrap the text content
     content = result.get("content", [])
@@ -106,8 +109,8 @@ def extract_payload(result: Any) -> Any:
             text = first["text"]
             if isinstance(text, str):
                 # Detect error text without isError flag
-                if any(kw in text for kw in _DAB_ERROR_KEYWORDS):
-                    logger.error("DAB returned error in text content: %s", text[:200])
+                if any(kw in text for kw in _ERROR_KEYWORDS):
+                    logger.error("MCP tool returned error in text content: %s", text[:200])
                     return {"isError": True, "message": text}
                 try:
                     parsed = json.loads(text)
@@ -125,13 +128,13 @@ def is_dab_error(result: Any) -> bool:
     if isinstance(result, dict):
         return bool(result.get("isError"))
     if isinstance(result, str):
-        return any(kw in result.lower() for kw in _DAB_ERROR_KEYWORDS)
+        return any(kw in result.lower() for kw in _ERROR_KEYWORDS)
     return False
 
 
 def extract_items_with_meta(result: Any) -> Tuple[List[Dict], int, bool, Optional[str]]:
     """
-    Extract items plus pagination metadata from a DAB response.
+    Extract items plus pagination metadata from a response.
 
     Returns: (items_list, count, has_next_page, end_cursor)
     """
@@ -151,7 +154,7 @@ def extract_items_with_meta(result: Any) -> Tuple[List[Dict], int, bool, Optiona
 def format_dab_items_context(tool_name: str, items: List[Dict], tool_args: Dict,
                               has_more: bool, end_cursor: Optional[str]) -> List[str]:
     """
-    Format DAB items into human-readable context lines for the LLM summarizer.
+    Format items into human-readable context lines for the LLM summarizer.
 
     Handles zero-row, single-value, and multi-row cases with appropriate
     warnings for missing personal data vs. restrictive filters.
