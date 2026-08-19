@@ -420,6 +420,20 @@ class DABClient:
         logger.warning("describe_entities: unexpected shape. type=%s", type(result).__name__)
         return []
 
+    def close(self) -> None:
+        """Close HTTP session and any open SSE response."""
+        try:
+            if self._sse_response is not None:
+                self._sse_response.close()
+                self._sse_response = None
+        except Exception as e:
+            logger.debug("Error closing SSE response: %s", e)
+        try:
+            if self._http is not None:
+                self._http.close()
+        except Exception as e:
+            logger.debug("Error closing HTTP session: %s", e)
+
 # ─────────────────────────────────────────────────────────
 # TENANT MANAGER
 # ─────────────────────────────────────────────────────────

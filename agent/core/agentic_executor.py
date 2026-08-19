@@ -1,14 +1,14 @@
 """
 agentic_executor.py
-Reflexive agent loop — delegates planning to tool_planner.py,
+Reflexive agent loop -- delegates planning to tool_planner.py,
 presentation to summarizer/response_summarizer.py (proven components).
 Uses DAB (Data API Builder)
 Implements Inform -> Assist -> Offer feedback via intent_category pipeline.
 
 Patches:
-  • Chart artifacts injected into LLM context as raw facts (not appended).
-  • Client-side dynamic binning for multi-tenant schemas (age, tenure, salary).
-  • Fixed aggregate column detection in post_aggregate; stripped 'first' for groupby complete data.
+  - Chart artifacts injected into LLM context as raw facts (not appended).
+  - Client-side dynamic binning for multi-tenant schemas (age, tenure, salary).
+  - Fixed aggregate column detection in post_aggregate; stripped 'first' for groupby complete data.
 """
 import json
 import logging
@@ -50,6 +50,14 @@ from agent.integrations.schema_registry import schema_registry_service
 
 logger = logging.getLogger("hr_agent")
 
+# Forecasting imports (guarded to avoid circular deps at module load time)
+def _get_forecasting_modules():
+    from agent.forecasting.external_data_fetcher import ExternalDataFetcher
+    from agent.forecasting.code_generator import CodeGenerator
+    from agent.core.sandbox import SubprocessSandbox
+    from agent.forecasting.output_parser import parse_and_validate
+    return ExternalDataFetcher, CodeGenerator, SubprocessSandbox, parse_and_validate
+
 
 def _is_aggregate_query_despite_discovery_classification(query: str) -> bool:
     """Heuristic guard: detect aggregate/data-retrieval queries misclassified as data_discovery.
@@ -73,7 +81,7 @@ def _is_aggregate_query_despite_discovery_classification(query: str) -> bool:
     return has_aggregate and not has_discovery
 
 
-# ─── Tool execution registry ────────────────────────────────────────────────
+# -"EUR-"EUR-"EUR Tool execution registry -"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR
 # Maps tool names to executor functions. Idiomatic replacement for string-matching in main loop.
 _TOOL_REGISTRY: Dict[str, Any] = {}
 
@@ -89,6 +97,8 @@ def _get_executor(tool_name: str):
         return _execute_dab_tool_call
     if tool_name.startswith("hana_"):
         return _execute_hana_tool_call
+    if tool_name.startswith("superset_"):
+        return _execute_superset_tool_call
     return None
 
 
@@ -226,7 +236,7 @@ async def run_reflexive_agent(
 
     session_state = load_session_state(auth_context)
 
-    intent_result = classify_intent(user_query, conversation_history)
+    intent_result = await classify_intent(user_query, conversation_history)
     logger.info(
         "Intent classified: intent=%s category=%s urgency=%s emotional=%s empathy=%s confidence=%.2f action_oriented=%s",
         intent_result.intent, intent_result.intent_category, intent_result.urgency_level,
@@ -306,10 +316,305 @@ async def run_reflexive_agent(
             chartable_data = session_state.get("last_chart_data", [])
             chart_config = session_state.get("last_chart_config", {})
         else:
-            logger.info("No steps — clarification needed")
+            logger.info("No steps -- clarification needed")
             return plan.get("reasoning", "Could you clarify what you're looking for?")
 
     if plan.get("steps"):
+        # -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
+        # FORECASTING PIPELINE -- handle forecasting queries end-to-end
+        # -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
+        is_forecasting = any(
+            step.get("tool") in ("fetch_external_data", "generate_code", "execute_sandbox", "summarize_forecast")
+            for step in plan.get("steps", [])
+        )
+        if is_forecasting:
+            logger.info("FORECASTING_PIPELINE: executing end-to-end forecast")
+            ExternalDataFetcher, CodeGenerator, SubprocessSandbox, parse_and_validate = _get_forecasting_modules()
+
+            # Prepare state for forecasting
+            forecast_state = {
+                "tool_results": {},
+                "tool_calls_made": [],
+                "rag_context": "",
+            }
+
+            # Step 1: fetch_external_data
+            enriched = {}
+            try:
+                client = dab_manager.get_client(tenant_id)
+
+                async def _dab_query(tool: str, args: Dict[str, Any]) -> Any:
+                    return await invoke_dab_tool_with_retry(client, tool, args)
+
+                fetcher = ExternalDataFetcher(dab_query_fn=_dab_query)
+                enriched = await fetcher.build_enriched_dataset(tenant_id=tenant_id)
+                input_path = fetcher.save_input_json(enriched)
+                forecast_state["tool_results"]["fetch_external_data"] = {
+                    "result": {
+                        "status": "success",
+                        "input_path": input_path,
+                        "hr_rows": len(enriched.get("hr_series", [])),
+                        "market_rows": len(enriched.get("market_series", [])),
+                        "merged_rows": len(enriched.get("merged_series", [])),
+                        "data_sources": enriched.get("metadata", {}).get("data_sources", []),
+                    }
+                }
+                forecast_state["tool_calls_made"].append({"tool": "fetch_external_data", "args": {"tenant_id": tenant_id}, "status": "SUCCESS"})
+                logger.info("FORECASTING: external data fetched, input saved to %s", input_path)
+            except Exception as exc:
+                logger.error("FORECASTING: external data fetch failed: %s", exc)
+                forecast_state["tool_results"]["fetch_external_data"] = {"error": str(exc)}
+                forecast_state["tool_calls_made"].append({"tool": "fetch_external_data", "args": {"tenant_id": tenant_id}, "status": f"ERROR: {exc}"})
+
+            # Step 2: generate_code
+            code_result = None
+            if enriched:
+                try:
+                    generator = CodeGenerator()
+                    code_result = generator.generate(
+                        question=user_query,
+                        enriched_data=enriched,
+                        model_type="statsforecast",
+                    )
+                    if code_result.success:
+                        forecast_state["tool_results"]["generate_code"] = {
+                            "result": {"status": "success", "model_type": code_result.model_type, "cached": code_result.cached}
+                        }
+                        forecast_state["tool_calls_made"].append({"tool": "generate_code", "args": {"model_type": "prophet"}, "status": "SUCCESS"})
+                        logger.info("FORECASTING: code generated (%d chars)", len(code_result.code))
+                    else:
+                        forecast_state["tool_results"]["generate_code"] = {"error": code_result.error}
+                        forecast_state["tool_calls_made"].append({"tool": "generate_code", "args": {"model_type": "prophet"}, "status": f"ERROR: {code_result.error}"})
+                except Exception as exc:
+                    logger.error("FORECASTING: code generation failed: %s", exc)
+                    forecast_state["tool_results"]["generate_code"] = {"error": str(exc)}
+
+            # Step 3: execute_sandbox
+            sandbox_result = None
+            if code_result and code_result.success:
+                try:
+                    sandbox = SubprocessSandbox()
+                    sandbox_result = sandbox.execute(code_result.code, enriched)
+                    if sandbox_result.success:
+                        forecast_state["tool_results"]["execute_sandbox"] = {
+                            "result": {
+                                "status": "success",
+                                "output_path": sandbox_result.output_path,
+                                "execution_time_seconds": sandbox_result.execution_time_seconds,
+                                "data_sources_used": sandbox_result.data_sources_used,
+                            }
+                        }
+                        forecast_state["tool_calls_made"].append({"tool": "execute_sandbox", "args": {}, "status": "SUCCESS"})
+                        logger.info("FORECASTING: sandbox executed in %.2fs", sandbox_result.execution_time_seconds)
+                    else:
+                        forecast_state["tool_results"]["execute_sandbox"] = {"error": sandbox_result.error}
+                        forecast_state["tool_calls_made"].append({"tool": "execute_sandbox", "args": {}, "status": f"ERROR: {sandbox_result.error}"})
+                        # Retry with fix
+                        if code_result:
+                            logger.info("FORECASTING: retrying code generation with error feedback")
+                            fix_result = generator.fix(code_result.code, sandbox_result.error or "Execution failed", enriched)
+                            if fix_result.success:
+                                sandbox_result = sandbox.execute(fix_result.code, enriched)
+                                if sandbox_result.success:
+                                    forecast_state["tool_results"]["execute_sandbox"] = {
+                                        "result": {
+                                            "status": "success_after_fix",
+                                            "output_path": sandbox_result.output_path,
+                                            "execution_time_seconds": sandbox_result.execution_time_seconds,
+                                            "data_sources_used": sandbox_result.data_sources_used,
+                                        }
+                                    }
+                                    forecast_state["tool_calls_made"][-1]["status"] = "SUCCESS_AFTER_FIX"
+                                    logger.info("FORECASTING: sandbox succeeded after fix")
+                except Exception as exc:
+                    logger.error("FORECASTING: sandbox execution failed: %s", exc)
+                    forecast_state["tool_results"]["execute_sandbox"] = {"error": str(exc)}
+
+            # Step 4: validate output + build forecast context
+            forecast_output = None
+            if sandbox_result and sandbox_result.success and sandbox_result.output_path:
+                try:
+                    with open(sandbox_result.output_path, "r", encoding="utf-8") as f:
+                        raw_output = json.load(f)
+                    forecast_output = parse_and_validate(raw_output)
+                    forecast_state["tool_results"]["forecast_output"] = {
+                        "result": forecast_output.raw
+                    }
+                    forecast_state["tool_calls_made"].append({"tool": "parse_output", "args": {}, "status": "SUCCESS"})
+                except Exception as exc:
+                    logger.error("FORECASTING: output parsing failed: %s", exc)
+                    forecast_state["tool_results"]["forecast_output"] = {"error": str(exc)}
+
+            # Build market context for summarizer
+            market_context_parts = []
+            if enriched.get("metadata"):
+                meta = enriched["metadata"]
+                market_context_parts.append(f"External data sources used: {', '.join(meta.get('external_sources', []))}")
+                market_context_parts.append(f"Internal data sources: {', '.join(meta.get('internal_sources', []))}")
+            if forecast_output and forecast_output.data_sources_used:
+                market_context_parts.append(f"Model data sources: {', '.join(forecast_output.data_sources_used)}")
+            if forecast_output and forecast_output.model_info.get("features_used"):
+                market_context_parts.append(f"Features used in model: {', '.join(forecast_output.model_info['features_used'])}")
+            market_context = "\n".join(market_context_parts)
+
+            # Inject forecast data into tool_results for summarizer
+            if forecast_output:
+                forecast_state["tool_results"]["__forecast"] = {
+                    "result": json.dumps(forecast_output.raw, default=str),
+                    "args": {"type": "forecast"}
+                }
+            if market_context:
+                forecast_state["tool_results"]["__market_context"] = {
+                    "result": market_context,
+                    "args": {"type": "market_context"}
+                }
+
+            # Skip normal step loop; proceed to summarization
+            state = forecast_state
+            chart_config = None
+            chartable_data = []
+            code_context_md = ""
+            binned_output_column = None
+            variance_text = ""
+            tool_results_for_summarizer = {}
+            for call_id, result in state["tool_results"].items():
+                if isinstance(result, dict) and "result" in result:
+                    tool_results_for_summarizer[call_id] = {
+                        "result": json.dumps(result["result"], default=str) if not isinstance(result["result"], str) else result["result"],
+                        "args": result.get("args", {})
+                    }
+                else:
+                    tool_results_for_summarizer[call_id] = {
+                        "result": json.dumps(result, default=str) if isinstance(result, dict) else str(result),
+                        "args": {}
+                    }
+
+            # Add special forecasting context
+            if "__forecast" in tool_results_for_summarizer:
+                tool_results_for_summarizer["__forecast"] = state["tool_results"]["__forecast"]
+            if "__market_context" in tool_results_for_summarizer:
+                tool_results_for_summarizer["__market_context"] = state["tool_results"]["__market_context"]
+
+            action_context = plan.get("action_context", "")
+
+            # Call summarizer with market context
+            answer = summarize_results(
+                user_query=user_query,
+                tool_results=tool_results_for_summarizer,
+                conversation_history=conversation_history,
+                chart_config=chart_config,
+                call_llm_fn=call_llm,
+                large_result_threshold=LARGE_RESULT_THRESHOLD,
+                tone_context=tone_context,
+                action_context=action_context,
+                export_url=state.get("export_url", ""),
+                wants_export=plan.get("needs_export", False) or intent_result.wants_export,
+                code_context=code_context_md,
+            )
+
+            save_session_state(auth_context, {
+                "last_query": user_query,
+                "last_intent": intent_result.intent,
+                "last_intent_category": intent_result.intent_category,
+                "last_data_scope": intent_result.data_scope,
+                "last_chart_data": chartable_data if chartable_data else session_state.get("last_chart_data"),
+                "last_chart_config": chart_config if chart_config else session_state.get("last_chart_config"),
+                "last_tool_results": state.get("tool_results") or session_state.get("last_tool_results", {}),
+                "last_export_url": state.get("export_url", "") or session_state.get("last_export_url", ""),
+                "last_forecast_result": forecast_output.raw if forecast_output else session_state.get("last_forecast_result"),
+            })
+            return answer
+
+        # -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
+        # SUPERSET DASHBOARD PIPELINE -- handle dashboard requests end-to-end
+        # -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
+        is_dashboard = (
+            tone_context.get("intent_category") == "dashboard_building"
+            or any(
+                step.get("tool", "") in ("superset_generate_dashboard", "superset_generate_chart")
+                for step in plan.get("steps", [])
+            )
+        )
+        if is_dashboard:
+            logger.info("SUPERSET_DASHBOARD_PIPELINE: executing dashboard workflow")
+            from agent.output.superset_dashboard import SupersetDashboardAgent
+
+            dashboard_agent = SupersetDashboardAgent()
+            dashboard_result = await dashboard_agent.handle(
+                user_query=user_query,
+                auth_context=auth_context,
+                tone_context=tone_context,
+            )
+
+            # Persist dashboard result in state for summarizer
+            state = {
+                "tool_results": {},
+                "tool_calls_made": [],
+                "rag_context": "",
+            }
+            state["tool_results"]["__superset_dashboard"] = {
+                "result": json.dumps(dashboard_result, default=str),
+                "args": {"type": "superset_dashboard"},
+            }
+            state["tool_calls_made"].append({
+                "tool": "superset_dashboard_agent",
+                "args": {"user_query": user_query},
+                "status": "SUCCESS" if dashboard_result.get("status") != "error" else f"ERROR: {dashboard_result.get('error')}",
+            })
+
+            # Skip normal step loop; proceed to summarization
+            chart_config = None
+            chartable_data = []
+            code_context_md = ""
+            binned_output_column = None
+            variance_text = ""
+            tool_results_for_summarizer = {}
+            for call_id, result in state["tool_results"].items():
+                if isinstance(result, dict) and "result" in result:
+                    tool_results_for_summarizer[call_id] = {
+                        "result": json.dumps(result["result"], default=str) if not isinstance(result["result"], str) else result["result"],
+                        "args": result.get("args", {})
+                    }
+                else:
+                    tool_results_for_summarizer[call_id] = {
+                        "result": json.dumps(result, default=str) if isinstance(result, dict) else str(result),
+                        "args": {}
+                    }
+
+            if "__superset_dashboard" in tool_results_for_summarizer:
+                tool_results_for_summarizer["__superset_dashboard"] = state["tool_results"]["__superset_dashboard"]
+
+            action_context = plan.get("action_context", "")
+
+            answer = summarize_results(
+                user_query=user_query,
+                tool_results=tool_results_for_summarizer,
+                conversation_history=conversation_history,
+                chart_config=chart_config,
+                call_llm_fn=call_llm,
+                large_result_threshold=LARGE_RESULT_THRESHOLD,
+                tone_context=tone_context,
+                action_context=action_context,
+                export_url=state.get("export_url", ""),
+                wants_export=plan.get("needs_export", False) or intent_result.wants_export,
+                code_context=code_context_md,
+            )
+
+            save_session_state(auth_context, {
+                "last_query": user_query,
+                "last_intent": intent_result.intent,
+                "last_intent_category": intent_result.intent_category,
+                "last_data_scope": intent_result.data_scope,
+                "last_chart_data": chartable_data if chartable_data else session_state.get("last_chart_data"),
+                "last_chart_config": chart_config if chart_config else session_state.get("last_chart_config"),
+                "last_tool_results": state.get("tool_results") or session_state.get("last_tool_results", {}),
+                "last_export_url": state.get("export_url", "") or session_state.get("last_export_url", ""),
+                # Preserve pending dashboard previews across the confirmation turn
+                "superset_pending_dashboard": session_state.get("superset_pending_dashboard"),
+            })
+            return answer
+
+        # Normal non-forecasting step loop
         state = {
             "tool_results": {},
             "tool_calls_made": [],
@@ -320,7 +625,7 @@ async def run_reflexive_agent(
             tool = step.get("tool", "")
             executor = _get_executor(tool)
             if executor is None:
-                logger.warning("No executor registered for tool '%s' — skipping", tool)
+                logger.warning("No executor registered for tool '%s' -- skipping", tool)
                 state["tool_calls_made"].append({"tool": tool, "args": step.get("args", {}), "status": "NO_EXECUTOR"})
                 continue
 
@@ -452,7 +757,7 @@ async def run_reflexive_agent(
 
     if fallback_used:
         logger.warning(
-            "AUTH_ROLE_FALLBACK: auth_role resolved via fallback — "
+            "AUTH_ROLE_FALLBACK: auth_role resolved via fallback -- "
             "permissions=%s internal_roles=%s. "
             "Investigate why permissions were not populated by auth layer.",
             sorted(perms) if perms else None,
@@ -640,9 +945,9 @@ async def run_reflexive_agent(
     return answer
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
 # DAB TOOL EXECUTION
-# ═════════════════════════════════════════════════════════════════════════════
+# -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
 
 async def _execute_dab_tool_call(step: Dict, state: Dict, auth_context: Any, tenant_id: str = "LOCALDEV", cached_schema: Dict = None, cached_tools: List[Dict] = None):
     from agent.main import enforce_tool_args, filter_tool_results
@@ -822,9 +1127,9 @@ async def _execute_dab_tool_call(step: Dict, state: Dict, auth_context: Any, ten
         record_dab_error("SystemError", entity=args.get("entity"))
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
 # HANA TOOL EXECUTION
-# ═════════════════════════════════════════════════════════════════════════════
+# -*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*-*
 
 async def _try_numeric_cast_retry(tool: str, args: Dict[str, Any], state: Dict, call_id: str, error_text: str, client: Any) -> bool:
     """Retry hana_execute_query with CAST(... AS DECIMAL) after a numeric-type error.
@@ -866,12 +1171,12 @@ async def _execute_hana_tool_call(step: Dict, state: Dict, auth_context: Any, te
     registry = schema_registry_service.get_registry(tenant_id)
 
     if tool == "hana_list_tables" and not args.get("schema_name"):
-        logger.warning("hana_list_tables called without schema_name — blocked")
+        logger.warning("hana_list_tables called without schema_name -- blocked")
         state["tool_results"][call_id] = {"error": "schema_name is required for hana_list_tables. Use a schema from the authorized list above."}
         state["tool_calls_made"].append({"tool": tool, "args": args, "status": "ERROR: missing schema_name"})
         return
 
-    # ── Registry diagnostics ──────────────────────────────────────────────
+    # -"EUR-"EUR Registry diagnostics -"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR-"EUR
     registry_size = len(registry) if registry else 0
     registry_tables = 0
     if registry:
@@ -932,3 +1237,31 @@ async def _execute_hana_tool_call(step: Dict, state: Dict, auth_context: Any, te
         state["tool_results"][call_id] = {"error": error_text}
         state["tool_calls_made"].append({"tool": tool, "args": args, "status": f"ERROR: {error_text}"})
         await _try_numeric_cast_retry(tool, args, state, call_id, error_text, client)
+
+
+async def _execute_superset_tool_call(step: Dict, state: Dict, auth_context: Any, tenant_id: str = "LOCALDEV", cached_schema: Dict = None, cached_tools: List[Dict] = None):
+    """Execute a Superset MCP tool call.
+
+    For non-dashboard tools (list/get/info/sql), calls MCP directly.
+    For chart/dashboard tools, calls MCP directly to avoid duplicating
+    the top-level dashboard pipeline's preview-first workflow.
+    """
+    from agent.integrations.superset_client import SupersetMCPClient
+
+    tool = step.get("tool", "")
+    args = step.get("args", {})
+    call_id = f"{tool}_{len(state['tool_calls_made'])}"
+
+    try:
+        client = SupersetMCPClient()
+        result = client.call_tool(tool.replace("superset_", ""), args)
+        state["tool_results"][call_id] = {"result": result, "args": args}
+        state["tool_calls_made"].append({"tool": tool, "args": args, "status": "SUCCESS"})
+        logger.info("SUPERSET tool %s succeeded (call_id=%s)", tool, call_id)
+
+    except Exception as exc:
+        error_text = str(exc)
+        logger.error("Superset tool %s failed: %s", tool, error_text)
+        state["tool_results"][call_id] = {"error": error_text}
+        state["tool_calls_made"].append({"tool": tool, "args": args, "status": f"ERROR: {error_text}"})
+

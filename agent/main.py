@@ -43,6 +43,8 @@ from agent.config import (
 )
 from agent.output.chart_generator import generate_chart, extract_chartable_data, CHART_OUTPUT_DIR
 from agent.core.tool_planner import build_tool_plan
+from agent.core.intent_classifier import get_intent_exemplar_index
+
 from agent.integrations.schema_index import (
     warm_schema_index,
     SchemaFieldIndex,
@@ -148,14 +150,14 @@ async def discover_tools():
                     if cached_dim == EMBEDDING_DIM:
                         schema_index_ready = True
                         logger.info(
-                            "Schema index cache exists at %s (dim=%d, age=%.0fs) — skipping warmup build.",
+                            "Schema index cache exists at %s (dim=%d, age=%.0fs) â€” skipping warmup build.",
                             cache_path.name,
                             cached_dim,
                             time.time() - float(data["built_at"]),
                         )
                     else:
                         logger.warning(
-                            "Schema cache dim mismatch (cached=%d, config=%d) — rebuilding.",
+                            "Schema cache dim mismatch (cached=%d, config=%d) â€” rebuilding.",
                             cached_dim,
                             EMBEDDING_DIM,
                         )
@@ -182,7 +184,7 @@ async def discover_tools():
     except Exception as e:
         logger.error("DAB tool discovery failed: %s", e)
 
-    # HANA schema discovery — run once at startup (independent of DAB)
+    # HANA schema discovery â€” run once at startup (independent of DAB)
     try:
         from agent.integrations.hana_client import hana_manager
         hana_schemas = await _discover_hana_schemas(tenant_id)
@@ -273,7 +275,7 @@ async def _discover_hana_schemas(tenant_id: str) -> Dict[str, List[str]]:
         existing = schema_registry_service._registries.get(tenant_id.upper())
         if existing and existing != schemas:
             logger.info(
-                "HANA schema registry mismatch for tenant=%s (cached=%d schemas, live=%d schemas) — invalidating cache",
+                "HANA schema registry mismatch for tenant=%s (cached=%d schemas, live=%d schemas) â€” invalidating cache",
                 tenant_id, len(existing), len(schemas),
             )
             schema_registry_service.invalidate_tenant(tenant_id)
@@ -484,7 +486,7 @@ async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
 
                 if live_schemas != cached_schemas:
                     logger.info(
-                        "SchemaRegistry: startup mismatch detected for tenant=%s (cached=%d schemas, live=%d schemas) — refreshing",
+                        "SchemaRegistry: startup mismatch detected for tenant=%s (cached=%d schemas, live=%d schemas) â€” refreshing",
                         tenant_id, len(cached_schemas), len(live_schemas),
                     )
                     schema_registry_service.invalidate_tenant(tenant_id)
@@ -499,7 +501,7 @@ async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
                 logger.warning("SchemaRegistry: startup validation failed for tenant=%s: %s", tenant_id, e)
         elif is_stale:
             logger.info(
-                "SchemaRegistry: startup stale cache detected for tenant=%s (age=%ds > TTL=%ds) — will reload on next access",
+                "SchemaRegistry: startup stale cache detected for tenant=%s (age=%ds > TTL=%ds) â€” will reload on next access",
                 tenant_id,
                 int(schema_registry_service._now() - schema_registry_service._last_loaded_at.get(tenant_key, 0)),
                 schema_registry_service.ttl_seconds,
@@ -544,6 +546,15 @@ async def lifespan(app: FastAPI):
         logger.info("HANA MCP client warmed up for discovery tenant: %s", discovery_tenant)
     except Exception as e:
         logger.info("HANA MCP warmup skipped or unavailable for tenant %s: %s", discovery_tenant, e)
+
+    # Pre-warm intent exemplar index off the request path.
+    # This only embeds on the very first startup when no disk cache exists.
+    if os.getenv("GEMINI_API_KEY"):
+        try:
+            await get_intent_exemplar_index()
+            logger.info("IntentExemplarIndex: pre-warmed at startup")
+        except Exception as e:
+            logger.warning("IntentExemplarIndex: startup pre-warm failed: %s", e)
 
     # Start background schema registry refresh (P2)
     try:
@@ -762,7 +773,7 @@ async def list_models(auth_context: AuthContext = Depends(verify_token)):
 
 @app.get("/charts/{filename}")
 async def serve_chart(filename: str):
-    """Serve generated chart PNGs. No auth required — filenames are random timestamps (unguessable)."""
+    """Serve generated chart PNGs. No auth required â€” filenames are random timestamps (unguessable)."""
     filepath = os.path.join(CHART_OUTPUT_DIR, filename)
     logger.info("CHART_SERVE: filename=%s exists=%s", filename, os.path.exists(filepath))
     if os.path.exists(filepath):
@@ -818,3 +829,4 @@ if __name__ == "__main__":
     print(f"Auth mode: {os.getenv('AUTH_MODE', 'test')}")
     print(f"Agent mode: {AGENT_MODE}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

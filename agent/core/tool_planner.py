@@ -1,26 +1,21 @@
 # agent/tool_planner.py
-"""Tool planning module for DAB (Data API Builder) — native tool calling.
+"""Tool planning module for DAB (Data API Builder) -- native tool calling.
 
 Production-grade architecture:
-  Native OpenAI tool calling — model emits structured tool_calls.
+  Native OpenAI tool calling -- model emits structured tool_calls.
 
 All previous fixes preserved:
-  • asyncio.to_thread for non-blocking LLM calls
-  • Schema-driven entity normalization
-  • Aligned client-side binning example
+  * asyncio.to_thread for non-blocking LLM calls
+  * Schema-driven entity normalization
+  * Aligned client-side binning example
 """
 import asyncio
-import hashlib
 import json
-import os
 import re
-import time
 import logging
-from datetime import datetime
 from typing import List, Dict, Optional, Any
 
 import jsonschema
-import tiktoken
 
 from agent.integrations.llm_client import call_llm
 from agent.integrations.hana_client import normalize_hana_result, get_cached_hana_tool_schemas
@@ -41,6 +36,7 @@ from agent.core.prompts import (
     build_user_context_rules,
     format_schema_for_prompt,
     format_schema_for_prompt_cached,
+    TOKEN_BUDGET,
 )
 from agent.core.utils import count_tokens, TTLCache, schema_cache
 from agent.hana.temporal import (
@@ -61,9 +57,9 @@ logger = logging.getLogger("hr_agent")
 _PLANNER_TIMEOUT_SECONDS = 30
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # DAB FILTER VALIDATION
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 def validate_dab_filter_permissions(filter_str: str, entity: str, auth_context: Any) -> tuple[bool, str]:
     if not auth_context or not auth_context.authenticated:
         return True, ""
@@ -103,9 +99,9 @@ def validate_dab_filter_permissions(filter_str: str, entity: str, auth_context: 
     return True, ""
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# NATIVE TOOL CALLING — OpenAI-compatible schemas for DAB tools
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# NATIVE TOOL CALLING -- OpenAI-compatible schemas for DAB tools
+# =============================================================================
 
 def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
     """Build OpenAI function-calling schemas for DAB MCP tools.
@@ -122,8 +118,8 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
             "description": (
                 "Query records from a DAB entity using OData filters. "
                 "Use eq, ne, gt, ge, lt, le, and, or, not. "
-                "Text filters do NOT support contains/LIKE — use exact eq or fetch broader. "
-                "For dates, use pre-computed fields like hire_year/hire_month — NEVER year(hire_date). "
+                "Text filters do NOT support contains/LIKE -- use exact eq or fetch broader. "
+                "For dates, use pre-computed fields like hire_year/hire_month -- NEVER year(hire_date). "
                 f"Available entities: {entity_examples}..."
             ),
             "parameters": {
@@ -234,9 +230,155 @@ def build_hana_tool_schemas(tenant_id: Optional[str] = None) -> List[Dict]:
     return get_cached_hana_tool_schemas(tenant_id=tenant_id)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TOOL SCHEMA VALIDATION — Fail fast on invalid tool arguments
-# ═════════════════════════════════════════════════════════════════════════════
+def build_superset_tool_schemas() -> List[Dict]:
+    """Build OpenAI function-calling schemas for Superset MCP dashboard tools."""
+    list_datasets_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_list_datasets",
+            "description": "List available Superset datasets. Use to discover what data sources are available for dashboard building.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filters": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Optional filters to narrow dataset list (e.g., by table_name containing 'hr')"
+                    }
+                },
+                "required": []
+            }
+        }
+    }
+
+    get_dataset_info_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_get_dataset_info",
+            "description": "Get schema, columns, and metadata for a specific Superset dataset. Use after selecting a dataset to understand available metrics and dimensions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset_id": {
+                        "type": "integer",
+                        "description": "ID of the dataset to inspect"
+                    }
+                },
+                "required": ["dataset_id"]
+            }
+        }
+    }
+
+    generate_chart_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_generate_chart",
+            "description": "Generate a chart preview or save it to Superset. Use save_chart=False for preview, save_chart=True to persist. Returns explore_url for preview and chart_id when saved.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset_id": {"type": "integer", "description": "Dataset to query"},
+                    "viz_type": {"type": "string", "description": "Chart type: bar, line, pie, big_number, table, etc."},
+                    "metrics": {"type": "array", "items": {"type": "string"}, "description": "Metrics to plot"},
+                    "groupby": {"type": "array", "items": {"type": "string"}, "description": "Dimensions to group by"},
+                    "filters": {"type": "array", "items": {"type": "object"}, "description": "Superset filter config"},
+                    "save_chart": {"type": "boolean", "description": "True to persist chart, False for preview only"},
+                    "chart_name": {"type": "string", "description": "Name for saved chart"}
+                },
+                "required": ["dataset_id", "viz_type"]
+            }
+        }
+    }
+
+    generate_dashboard_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_generate_dashboard",
+            "description": "Build a Superset dashboard from saved chart IDs with auto-layout. Use only after user confirms previewed charts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dashboard_title": {"type": "string", "description": "Title for the new dashboard"},
+                    "charts": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "List of chart specs or saved chart IDs"
+                    },
+                    "auto_layout": {"type": "boolean", "description": "Use automatic grid layout"},
+                    "layout_mode": {"type": "string", "description": "Layout mode: grid or free_form"},
+                    "description": {"type": "string", "description": "Dashboard description"}
+                },
+                "required": ["dashboard_title"]
+            }
+        }
+    }
+
+    execute_sql_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_execute_sql",
+            "description": "Execute SQL against a Superset dataset or database. Use for ad-hoc queries when pre-built datasets are insufficient.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "SQL query to execute"},
+                    "dataset_id": {"type": "integer", "description": "Optional dataset context"},
+                    "limit": {"type": "integer", "description": "Max rows to return"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
+
+    create_virtual_dataset_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_create_virtual_dataset",
+            "description": "Create a virtual dataset in Superset from a SQL query. Use when existing datasets don't expose the needed metrics.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Dataset name"},
+                    "sql": {"type": "string", "description": "SQL query defining the dataset"},
+                    "schema": {"type": "string", "description": "Database schema"},
+                    "database_id": {"type": "integer", "description": "Superset database ID"}
+                },
+                "required": ["name", "sql"]
+            }
+        }
+    }
+
+    add_chart_to_existing_dashboard_schema = {
+        "type": "function",
+        "function": {
+            "name": "superset_add_chart_to_existing_dashboard",
+            "description": "Add an already-saved chart to an existing dashboard.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dashboard_id": {"type": "integer", "description": "Target dashboard ID"},
+                    "chart_id": {"type": "integer", "description": "Chart to add"},
+                    "position": {"type": "object", "description": "Optional position config"}
+                },
+                "required": ["dashboard_id", "chart_id"]
+            }
+        }
+    }
+
+    return [
+        list_datasets_schema,
+        get_dataset_info_schema,
+        generate_chart_schema,
+        generate_dashboard_schema,
+        execute_sql_schema,
+        create_virtual_dataset_schema,
+        add_chart_to_existing_dashboard_schema,
+    ]
+
+
+# =============================================================================
+# TOOL SCHEMA VALIDATION -- Fail fast on invalid tool arguments
+# =============================================================================
 
 # Cached tool schemas for validation: {tool_name: {properties, required}}
 _TOOL_SCHEMA_MAP: Dict[str, Dict] = {}
@@ -275,21 +417,33 @@ def validate_tool_args(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
         return f"Invalid arguments for {tool_name}: {e.message}"
 
 
-def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True, tenant_id: Optional[str] = None) -> List[Dict]:
-    """Merge DAB and HANA tool schemas for the planner prompt.
+def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True, tenant_id: Optional[str] = None, include_superset: bool = True) -> List[Dict]:
+    """Merge DAB, HANA, and Superset tool schemas for the planner prompt.
 
     Args:
         cached_schema: DAB entity schema map.
         include_hana: If True, append HANA schemas (requires HANA server reachable).
         tenant_id: Tenant identifier for HANA tool cache lookup.
+        include_superset: If True, append Superset dashboard schemas.
     """
     schemas = list(build_dab_tool_schemas(cached_schema))
     if include_hana:
         schemas.extend(build_hana_tool_schemas(tenant_id=tenant_id))
+    if include_superset:
+        schemas.extend(build_superset_tool_schemas())
     return schemas
 
 
 _ALL_DAB_TOOLS = {"read_records", "aggregate_records", "describe_entities"}
+_ALL_SUPERSET_TOOLS = {
+    "superset_list_datasets",
+    "superset_get_dataset_info",
+    "superset_generate_chart",
+    "superset_generate_dashboard",
+    "superset_execute_sql",
+    "superset_create_virtual_dataset",
+    "superset_add_chart_to_existing_dashboard",
+}
 
 
 def extract_steps_from_tool_calls(
@@ -313,13 +467,13 @@ def extract_steps_from_tool_calls(
             for s in hana_schemas
             if isinstance(s, dict) and s.get("function", {}).get("name")
         }
-        allowed_tools = _ALL_DAB_TOOLS | hana_tools
+        allowed_tools = _ALL_DAB_TOOLS | hana_tools | _ALL_SUPERSET_TOOLS
 
     steps = []
     for tc in tool_calls:
         tool_name = tc["function"]["name"]
         if tool_name not in allowed_tools:
-            logger.warning("LLM tried to call unauthorized tool '%s' — skipping", tool_name)
+            logger.warning("LLM tried to call unauthorized tool '%s' -- skipping", tool_name)
             continue
         try:
             args = json.loads(tc["function"]["arguments"])
@@ -331,7 +485,7 @@ def extract_steps_from_tool_calls(
         if tool_schema_map and tool_name in tool_schema_map:
             validation_error = validate_tool_args(tool_name, args)
             if validation_error:
-                logger.warning("LLM tool arg validation failed for %s: %s — skipping", tool_name, validation_error)
+                logger.warning("LLM tool arg validation failed for %s: %s -- skipping", tool_name, validation_error)
                 continue
 
         steps.append({"tool": tool_name, "args": args})
@@ -376,9 +530,9 @@ def _normalize_entity_names(steps: List[Dict], cached_schema: Dict) -> List[Dict
     return steps
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# METADATA INFERENCE — Heuristic chart/rag/binning from query + steps
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# METADATA INFERENCE -- Heuristic chart/rag/binning from query + steps
+# =============================================================================
 
 # Chart intent patterns using word boundaries to avoid false positives
 # (e.g., "chartroom" should not match "chart").
@@ -484,7 +638,7 @@ async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optio
             }
         return metadata
 
-    # ── Chart inference (intent category + data shape, NOT keywords) ──
+    # -- Chart inference (intent category + data shape, NOT keywords) --
     chart_eligible = tone_context.get("chart_eligible", False) if tone_context else False
 
     # Must also have aggregate step with groupby OR read_records with 2-column select
@@ -564,13 +718,30 @@ async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optio
             "trend_line": chart_type == "line" and any(kw in query_lower for kw in ("trend line", "trend", "with trend")),
         }
 
-    # ── RAG inference ──
+    # -- Dashboard inference (Superset dashboard building) --
+    has_superset_dashboard = any(s["tool"] == "superset_generate_dashboard" for s in steps)
+    has_superset_chart = any(s["tool"] == "superset_generate_chart" for s in steps)
+    has_superset_dataset = any(s["tool"] in ("superset_list_datasets", "superset_get_dataset_info") for s in steps)
+
+    if category == "dashboard_building" or has_superset_dashboard or has_superset_chart:
+        metadata["dashboard_build"] = {
+            "has_superset_dashboard": has_superset_dashboard,
+            "has_superset_chart": has_superset_chart,
+            "has_superset_dataset": has_superset_dataset,
+            "pending_preview_charts": [],
+            "confirmed_chart_ids": [],
+            "dashboard_title": user_query[:80],
+        }
+        logger.info("Planner: dashboard_build metadata inferred (category=%s, dashboard=%s, chart=%s, dataset=%s)",
+                     category, has_superset_dashboard, has_superset_chart, has_superset_dataset)
+
+    # -- RAG inference --
     rag_keywords = ["policy", "rule", "handbook", "procedure", "guideline", "entitled", "eligible", "how do i", "how to"]
     if any(kw in query_lower for kw in rag_keywords) or category == "policy_info":
         metadata["rag"] = True
         metadata["rag_query"] = user_query
 
-    # ── Export intent inference ──
+    # -- Export intent inference --
     export_keywords = ("export", "download", "save", "excel", "spreadsheet",
                          "xlsx", "workbook", "file", "send me", "give me the data")
     wants_export = (
@@ -581,7 +752,7 @@ async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optio
     if wants_export:
         metadata["needs_export"] = True
 
-    # ── Client-side binning inference ──
+    # -- Client-side binning inference --
     if has_aggregate:
         for step in steps:
             if step["tool"] == "aggregate_records":
@@ -596,10 +767,10 @@ async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optio
                         metadata["client_side_binning"] = bin_config
                         logger.info("infer_metadata: resolved binning for '%s' -> canonical '%s'", raw_col, canonical)
 
-    # ── Action context ──
+    # -- Action context --
     metadata["action_context"] = tone_context.get("action_context", "")
 
-    # ── Reasoning ──
+    # -- Reasoning --
     metadata["reasoning"] = (
         f"Selected {len(steps)} tool(s) based on query intent ({category}). "
         f"Chart={'yes' if metadata['chart'] else 'no'}, RAG={'yes' if metadata['rag'] else 'no'}, "
@@ -609,9 +780,9 @@ async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optio
     return metadata
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # SYSTEM PROMPTS
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 
 async def build_tool_plan(
     user_query: str,
@@ -630,6 +801,30 @@ async def build_tool_plan(
         return _empty_plan()
 
     tenant_id = getattr(auth_context, "tenant_id", "default") if auth_context else "default"
+
+    # =======================================================================
+    # FORECASTING PIPELINE -- bypass native tool calling for forecasting queries
+    # =======================================================================
+    intent = (tone_context or {}).get("intent", "")
+    if intent == "forecasting_query":
+        logger.info("Planner: forecasting_query detected -- returning forecasting pipeline plan")
+        plan = {
+            "steps": [
+                {"tool": "fetch_external_data", "args": {"tenant_id": tenant_id}},
+                {"tool": "generate_code", "args": {"model_type": "statsforecast"}},
+                {"tool": "execute_sandbox", "args": {}},
+                {"tool": "summarize_forecast", "args": {}},
+            ],
+            "direct_answer": "",
+            "chart": None,
+            "rag": False,
+            "rag_query": "",
+            "needs_export": False,
+            "reasoning": "Forecasting pipeline: external data -> codegen -> sandbox -> summarize",
+            "action_context": "",
+            "client_side_binning": None,
+        }
+        return plan
     schema_block = await format_schema_for_prompt_cached(
         cached_schema, tenant_id=tenant_id, user_query=user_query
     )
@@ -669,9 +864,9 @@ async def build_tool_plan(
             )
         full_query = "Previous conversation:\n" + conversation_history + "\n\nCurrent question: " + user_query
 
-    # ═══════════════════════════════════════════════════════════════════════
+    # =======================================================================
     # Native tool calling
-    # ═══════════════════════════════════════════════════════════════════════
+    # =======================================================================
     all_tools = build_all_tool_schemas(cached_schema, include_hana=True, tenant_id=tenant_id)
     tool_schema_map = _build_tool_schema_map(cached_schema, include_hana=True)
 
@@ -724,7 +919,7 @@ async def build_tool_plan(
         steps = _normalize_entity_names(steps, cached_schema)
         logger.info("Planner: Tool calling produced %d steps: %s", len(steps), [s["tool"] for s in steps])
 
-        # ── SQL validation and semantic-template repair ─────────────────────
+        # -- SQL validation and semantic-template repair ---------------------
         validated_steps = []
         for step in steps:
             if step.get("tool") == "hana_execute_query":
@@ -762,9 +957,9 @@ async def build_tool_plan(
             "client_side_binning": metadata.get("client_side_binning"),
         }
 
-        # ═══════════════════════════════════════════════════════════════════════
-        # TEMPORAL REASONING — resolve year for financial queries
-        # ═══════════════════════════════════════════════════════════════════════
+        # =======================================================================
+        # TEMPORAL REASONING -- resolve year for financial queries
+        # =======================================================================
         if is_financial_metric_query(user_query):
             available_years = await get_available_fiscal_years(tenant_id)
             temporal = resolve_temporal_context(user_query, available_years)
@@ -772,7 +967,7 @@ async def build_tool_plan(
                 plan["temporal_context"] = temporal
                 plan["reasoning"] += " " + temporal.get("note", "")
 
-        logger.info("Planner: SUCCESS — %d steps, chart=%s, rag=%s, binning=%s",
+        logger.info("Planner: SUCCESS -- %d steps, chart=%s, rag=%s, binning=%s",
                    len(plan["steps"]),
                    "yes" if plan["chart"] else "no",
                    "yes" if plan["rag"] else "no",
