@@ -1,0 +1,215 @@
+# config/metrics.yaml
+#
+# Single source of truth for metric keyword extraction (financial + HR).
+#
+# Drives:
+#   - agent/output/metric_registry.py   (fast gate, canonical normalization, LLM prompt)
+#   - agent/hana/temporal.py            (is_financial_metric_query keyword set)
+#
+# Fields:
+#   canonical     : normalized metric key returned by the fast gate
+#   domain        : financial | hr
+#   chart_metric  : true  -> used by chart fast gate + LLM allowed-metrics list
+#                   false -> financial-domain *signal* word; used for temporal routing
+#                            but NOT exposed as a chart metric
+#   substring     : true  -> matched by substring, not word-boundary regex; only for
+#                            ambiguous short tokens (gl / ap / ar with trailing space)
+#   aliases       : phrases matched case-insensitively against the query
+#
+# NOTE: bare "turnover" is intentionally EXCLUDED from HR. In this repo
+# agent/integrations/hana_sql.py maps "turnover" -> revenue (finance). HR
+# attrition is captured via "employee turnover" / "staff turnover" / "attrition".
+metrics:
+  # ---------------- Financial chart metrics ----------------
+  - canonical: revenue
+    domain: financial
+    chart_metric: true
+    aliases: [revenue, sales]
+  - canonical: expense
+    domain: financial
+    chart_metric: true
+    aliases: [expense]
+  - canonical: profit
+    domain: financial
+    chart_metric: true
+    aliases: [profit]
+  - canonical: gross_profit
+    domain: financial
+    chart_metric: true
+    aliases: [gross profit, gross_profit, grossprofit]
+  - canonical: net_profit
+    domain: financial
+    chart_metric: true
+    aliases: [net profit, net_profit, netprofit]
+  - canonical: operating_income
+    domain: financial
+    chart_metric: true
+    aliases: [operating income]
+  - canonical: ebitda
+    domain: financial
+    chart_metric: true
+    aliases: [ebitda]
+  - canonical: cost
+    domain: financial
+    chart_metric: true
+    aliases: [cost]
+  - canonical: margin
+    domain: financial
+    chart_metric: true
+    aliases: [margin]
+  - canonical: income
+    domain: financial
+    chart_metric: true
+    aliases: [income]
+  - canonical: loss
+    domain: financial
+    chart_metric: true
+    aliases: [loss]
+  - canonical: budget
+    domain: financial
+    chart_metric: true
+    aliases: [budget]
+  - canonical: actual
+    domain: financial
+    chart_metric: true
+    aliases: [actual]
+  - canonical: profitability
+    domain: financial
+    chart_metric: true
+    aliases: [profitability]
+
+  # ---------------- Financial domain signals (not chart metrics) ----------------
+  - canonical: balance_sheet
+    domain: financial
+    chart_metric: false
+    aliases: [balance sheet, balance_sheet]
+  - canonical: cash_flow
+    domain: financial
+    chart_metric: false
+    aliases: [cash flow, cashflow, cash flow statement]
+  - canonical: general_ledger
+    domain: financial
+    chart_metric: false
+    aliases: [general ledger]
+  - canonical: accounts_payable
+    domain: financial
+    chart_metric: false
+    aliases: [accounts payable]
+  - canonical: accounts_receivable
+    domain: financial
+    chart_metric: false
+    aliases: [accounts receivable]
+  - canonical: invoice
+    domain: financial
+    chart_metric: false
+    aliases: [invoice]
+  - canonical: vendor
+    domain: financial
+    chart_metric: false
+    aliases: [vendor]
+  - canonical: customer
+    domain: financial
+    chart_metric: false
+    aliases: [customer]
+  - canonical: payment
+    domain: financial
+    chart_metric: false
+    aliases: [payment]
+  - canonical: receipt
+    domain: financial
+    chart_metric: false
+    aliases: [receipt]
+  - canonical: bank
+    domain: financial
+    chart_metric: false
+    aliases: [bank]
+  - canonical: cash
+    domain: financial
+    chart_metric: false
+    aliases: [cash]
+  - canonical: asset
+    domain: financial
+    chart_metric: false
+    aliases: [asset]
+  - canonical: liability
+    domain: financial
+    chart_metric: false
+    aliases: [liability]
+  - canonical: equity
+    domain: financial
+    chart_metric: false
+    aliases: [equity]
+  - canonical: depreciation
+    domain: financial
+    chart_metric: false
+    aliases: [depreciation]
+  - canonical: amortization
+    domain: financial
+    chart_metric: false
+    aliases: [amortization]
+  - canonical: tax
+    domain: financial
+    chart_metric: false
+    aliases: [tax, taxation]
+  - canonical: financial
+    domain: financial
+    chart_metric: false
+    aliases: [financial, finance]
+  - canonical: fiscal
+    domain: financial
+    chart_metric: false
+    aliases: [fiscal]
+  - canonical: accounting
+    domain: financial
+    chart_metric: false
+    aliases: [accounting]
+  # Ambiguous short tokens: substring match only (preserves original behaviour)
+  - canonical: gl_signal
+    domain: financial
+    chart_metric: false
+    substring: true
+    aliases: ["gl "]
+  - canonical: ap_signal
+    domain: financial
+    chart_metric: false
+    substring: true
+    aliases: ["ap "]
+  - canonical: ar_signal
+    domain: financial
+    chart_metric: false
+    substring: true
+    aliases: ["ar "]
+
+  # ---------------- HR chart metrics ----------------
+  - canonical: headcount
+    domain: hr
+    chart_metric: true
+    aliases: [headcount, head count, head_count, workforce, staffing, fte]
+  - canonical: hires
+    domain: hr
+    chart_metric: true
+    aliases: [hires, hire, hiring, new hires, new joiners, joiners, onboarding, recruitment]
+  - canonical: terminations
+    domain: hr
+    chart_metric: true
+    aliases: [terminations, termination, resignations, resignation]
+  - canonical: attrition
+    domain: hr
+    chart_metric: true
+    aliases: [attrition, employee turnover, staff turnover]
+  - canonical: retention
+    domain: hr
+    chart_metric: true
+    aliases: [retention, retention_rate, retention rate]
+  - canonical: tenure
+    domain: hr
+    chart_metric: true
+    aliases: [tenure]
+  - canonical: leave
+    domain: hr
+    chart_metric: true
+    aliases: [leave, leave balance, leave_balance, leave taken, absenteeism, absence, leave entitlement]
+  - canonical: salary
+    domain: hr
+    chart_metric: true
+    aliases: [salary, basic_salary, basic salary, compensation, remuneration, wages, payroll]

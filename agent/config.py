@@ -38,6 +38,20 @@ PLANNER_ESTIMATED_TOKENS = int(os.getenv("PLANNER_ESTIMATED_TOKENS", "5500"))
 CONVERSATION_HISTORY_TOKEN_BUDGET = int(os.getenv("CONVERSATION_HISTORY_TOKEN_BUDGET", "2000"))
 
 # ==============================
+# FORECASTING ENGINE
+# ==============================
+SANDBOX_MEMORY_MB = int(os.getenv("SANDBOX_MEMORY_MB", "512"))
+SANDBOX_TIMEOUT_SECONDS = int(os.getenv("SANDBOX_TIMEOUT_SECONDS", "30"))
+SANDBOX_MAX_FILES = int(os.getenv("SANDBOX_MAX_FILES", "64"))
+FORECAST_TEMP_DIR = os.getenv("FORECAST_TEMP_DIR", None)
+FORECAST_DATA_DIR = os.getenv("FORECAST_DATA_DIR", None)
+FORECAST_HORIZON_MONTHS = int(os.getenv("FORECAST_HORIZON_MONTHS", "6"))
+FORECAST_EXTERNAL_MONTHS = int(os.getenv("FORECAST_EXTERNAL_MONTHS", "24"))
+FORECAST_MODEL_DEFAULT = os.getenv("FORECAST_MODEL_DEFAULT", "statsforecast")
+DOSM_BASE_URL = os.getenv("DOSM_BASE_URL", "https://api.data.gov.my/opendosm")
+WORLD_BANK_BASE_URL = os.getenv("WORLD_BANK_BASE_URL", "https://api.worldbank.org/v2")
+
+# ==============================
 # SCHEMA REGISTRY
 # ==============================
 SCHEMA_REGISTRY_TTL_SECONDS = int(os.getenv("SCHEMA_REGISTRY_TTL_SECONDS", "3600"))
@@ -50,3 +64,12 @@ CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "hr_policies")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.20"))
+
+# ==============================
+# AGENTIC SYSTEM USER
+# ==============================
+# Numeric user ID written to create_by/modify_by columns (Int64 in the HRMS
+# schema) when the agentic AI creates records on behalf of an employee.
+# Value 1 identifies the agentic AI system as the record creator, instead of
+# the employee_no string (e.g. "A0001") which DAB rejects for Int64 columns.
+AGENT_SYSTEM_USER_ID = int(os.getenv("AGENT_SYSTEM_USER_ID", "1"))

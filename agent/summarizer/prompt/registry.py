@@ -36,13 +36,18 @@ ASSIST_REGISTRY = _load_assist_registry()
 
 
 def get_assist_suggestions(category: str, has_data: bool, has_empty: bool,
-                            action_context: str = "") -> List[str]:
+                            action_context: str = "", intent: str = "") -> List[str]:
     """
     Get assist suggestions from registry.
     Falls back to generic suggestions if category not found.
+    
+    Lookup order: intent -> category -> policy_info
+    This allows intent-specific guidance (e.g. leave_request) to override
+    category-level guidance (e.g. action_request) without hardcoding.
     """
     state = "has_data" if has_data else "empty_result"
-    registry = ASSIST_REGISTRY.get(category, ASSIST_REGISTRY.get("policy_info", {}))
+    # Try intent-specific lookup first, then category, then fallback
+    registry = ASSIST_REGISTRY.get(intent, ASSIST_REGISTRY.get(category, ASSIST_REGISTRY.get("policy_info", {})))
     suggestions = registry.get(state, [])
 
     if action_context and has_data:

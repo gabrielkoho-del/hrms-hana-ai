@@ -466,7 +466,12 @@ class _HttpMpcClient:
             except requests.exceptions.ConnectionError as e:
                 last_error = e
                 logger.warning("HANA HTTP connection failed (attempt %d): %s", attempt + 1, e)
-                time.sleep(0.5 * (2 ** attempt))
+                # Server refused the connection -- it is definitively down, so
+                # mark it globally and stop retrying immediately. Retrying
+                # against a dead server only adds warning noise and latency;
+                # downstream callers already skip HANA once it is marked down.
+                mark_hana_unavailable()
+                raise
             except requests.exceptions.Timeout as e:
                 last_error = e
                 logger.warning("HANA HTTP timeout (attempt %d): %s", attempt + 1, e)
@@ -723,6 +728,33 @@ _CACHED_HANA_TOOL_SCHEMAS: Dict[str, List[Dict]] = {}
 _HANA_TOOLS_DISCOVERED = False
 _HANA_TOOL_SCHEMAS_LOCK = asyncio.Lock()
 
+# Global HANA availability flag. Once a connection attempt is observed to fail
+# (e.g. HANA MCP server is down at startup), this is set to False so downstream
+# callers (planner, schema registry, executor) skip HANA connection attempts
+# during request handling instead of retrying against a dead server on every
+# user query.
+HANA_AVAILABLE: bool = True
+
+
+def is_hana_available() -> bool:
+    """Return False once HANA connectivity has been observed to fail.
+
+    Callers use this to avoid hammering an unreachable HANA MCP server on each
+    request. The flag is sticky for the process lifetime (a restart recovers).
+    """
+    return HANA_AVAILABLE
+
+
+def mark_hana_unavailable() -> None:
+    """Record that HANA is unreachable so callers stop attempting connections."""
+    global HANA_AVAILABLE
+    if HANA_AVAILABLE:
+        HANA_AVAILABLE = False
+        logger.warning(
+            "HANA marked UNAVAILABLE after connection failure; "
+            "skipping further HANA connection attempts during requests."
+        )
+
 
 def _convert_mcp_tool_to_openai(mcp_tool: Dict[str, Any]) -> Dict[str, Any]:
     """Convert an MCP tool definition to OpenAI function-calling format."""
@@ -775,6 +807,12 @@ async def refresh_hana_tool_schemas(tenant_id: Optional[str] = None, http_url: O
     """
     global _HANA_TOOLS_DISCOVERED
     key = (tenant_id or "default").upper()
+
+    # If HANA was observed to be down, don't attempt a connection -- return the
+    # static fallback schemas immediately so request handling stays fast.
+    if not is_hana_available():
+        logger.info("HANA unavailable -- returning static tool schemas without connection (tenant=%s)", key)
+        return list(_STATIC_HANA_TOOL_SCHEMAS)
 
     async with _HANA_TOOL_SCHEMAS_LOCK:
         if _HANA_TOOLS_DISCOVERED and key in _CACHED_HANA_TOOL_SCHEMAS:

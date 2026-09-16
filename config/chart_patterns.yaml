@@ -1,0 +1,76 @@
+# Chart intent patterns using word boundaries to avoid false positives
+# (e.g., "chartroom" should not match "chart").
+chart_type_patterns:
+  - pattern: "\\bbar\\s+(chart|graph|plot)\\b"
+    type: "bar"
+  - pattern: "\\bcolumn\\s+(chart|graph|plot)\\b"
+    type: "bar"
+  - pattern: "\\bpie\\s+(chart|graph|plot|donut)\\b"
+    type: "pie"
+  - pattern: "\\bdoughnut\\s+(chart|graph|plot)\\b"
+    type: "doughnut"
+  - pattern: "\\bdonut\\s+(chart|graph|plot)\\b"
+    type: "doughnut"
+  - pattern: "\\bline\\s+(chart|graph|plot|trend|time\\s*series)\\b"
+    type: "line"
+  - pattern: "\\barea\\s+(chart|graph|plot)\\b"
+    type: "area"
+  - pattern: "\\bhistogram\\b|\\bhist\\s+chart\\b|\\bdistribution\\s+chart\\b"
+    type: "hist"
+  - pattern: "\\bbox\\s*plot\\b|\\bbox\\s*chart\\b|\\bboxplot\\b"
+    type: "box"
+  - pattern: "\\bscatter\\s+(plot|chart|graph)\\b"
+    type: "scatter"
+  - pattern: "\\bheat\\s*map\\b|\\bheatmap\\b"
+    type: "heatmap"
+  - pattern: "\\bgauge\\s+chart\\b|\\bkpi\\s+gauge\\b|\\bgauge\\b"
+    type: "gauge"
+  - pattern: "\\bradar\\s+(chart|plot|graph)\\b|\\bradar\\b"
+    type: "radar"
+
+# General chart intent: user wants a visual representation, but didn't specify type.
+# Uses word boundaries to avoid matching "chartroom", "epicchart", etc.
+general_chart_pattern: "\\b(chart|graph|visualize|visualization|plot|dashboard|kpi)\\b"
+
+# Multi-chart dashboard intent patterns.
+multi_chart_patterns:
+  - "\\b(multi[-\\s]?chart|dashboard|multiple\\s+charts?)\\b"
+  - "\\b(and|,)\\s+(headcount|salary|turnover|average|count|distribution)\\s+by\\b"
+  - "\\b(show|display|give)\\s+me\\s+.*\\s+and\\s+.*\\s+by\\b"
+  - "\\b(compare|versus|vs)\\b.*\\b(and|,)\\b"
+  - "\\b(executive\\s+(overview|summary|dashboard))\\b"
+  - "\\b(workforce\\s+(overview|summary|dashboard))\\b"
+  - "\\b(hr\\s+(overview|summary|dashboard))\\b"
+  - "\\b(people\\s+(overview|summary|dashboard))\\b"
+  - "\\b(talent\\s+(overview|summary|dashboard))\\b"
+  - "\\b(organizational\\s+(overview|summary|dashboard))\\b"
+  - "\\b(headcount\\s+(overview|summary|dashboard))\\b"
+  - "\\b(compensation\\s+(overview|summary|dashboard))\\b"
+  - "\\b(diversity\\s+(overview|summary|dashboard))\\b"
+  - "\\b(turnover\\s+(overview|summary|dashboard))\\b"
+  - "\\b(retention\\s+(overview|summary|dashboard))\\b"
+
+# RAG intent keywords.
+rag_keywords:
+  - "policy"
+  - "rule"
+  - "handbook"
+  - "procedure"
+  - "guideline"
+  - "entitled"
+  - "eligible"
+  - "how do i"
+  - "how to"
+
+# Export intent keywords.
+export_keywords:
+  - "export"
+  - "download"
+  - "save"
+  - "excel"
+  - "spreadsheet"
+  - "xlsx"
+  - "workbook"
+  - "file"
+  - "send me"
+  - "give me the data"

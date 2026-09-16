@@ -1,6 +1,12 @@
-from typing import Dict
+from typing import Dict, List
 
-from agent.summarizer.prompt.registry import ACTION_CATEGORIES, PERSONAL_DATA_CATEGORIES
+from agent.summarizer.prompt.registry import ACTION_CATEGORIES, PERSONAL_DATA_CATEGORIES, ASSIST_REGISTRY
+
+
+def _get_response_structure_guidance(intent: str, stage: str, default: str) -> str:
+    """Lookup response structure guidance from registry by intent."""
+    guidance = ASSIST_REGISTRY.get("response_structure", {}).get(intent, {})
+    return guidance.get(stage, default)
 
 
 def build_response_structure(category: str, has_data: bool, has_empty_result: bool,
@@ -12,6 +18,7 @@ def build_response_structure(category: str, has_data: bool, has_empty_result: bo
     parts = []
     emotional = tone_context.get("emotional_state", "neutral")
     urgency = tone_context.get("urgency_level", "routine")
+    intent = tone_context.get("intent", "")
 
     # STAGE 1: INFORM
     parts.append(
@@ -23,15 +30,68 @@ def build_response_structure(category: str, has_data: bool, has_empty_result: bo
 
     # STAGE 2: ASSIST
     if has_empty_result:
-        parts.append(
+        stage2_guidance = _get_response_structure_guidance(
+            intent,
+            "stage2_empty",
             "STAGE 2 - ASSIST: No data found. Explain what you checked (specific entity, filter), "
             "then offer 2-3 NUMBERED next steps the user can choose from. Be specific. "
             "Example: 'I checked your 2025 leave records and found no matches. You could: "
             "(1) check all years, (2) verify your employee ID with HR, (3) ask me to search with a different filter. "
             "Which would you like?'"
         )
-    elif has_data and (action_oriented or category in ACTION_CATEGORIES):
+        parts.append(stage2_guidance)
+
+    # Unified pending-slots handler — replaces hardcoded missing_date / missing_leave_type.
+    # Any injector can produce a pending_slot; the summarizer asks generically from user_question.
+    # When multiple slots are missing (e.g. both date and leave type for a leave application),
+    # ask for ALL of them in a single turn rather than one at a time to avoid round-trips.
+    pending_slots = tone_context.get("pending_slots", [])
+    if pending_slots:
+        # Deduplicate by (entity, field) in case injectors produced duplicates.
+        seen_slots: set = set()
+        unique_slots: List[Dict] = []
+        for slot in pending_slots:
+            key = (slot.get("entity", ""), slot.get("field", ""))
+            if key not in seen_slots:
+                seen_slots.add(key)
+                unique_slots.append(slot)
+
+        if len(unique_slots) == 1:
+            slot = unique_slots[0]
+            user_question = slot.get("user_question", "Could you provide more details?")
+            entity = slot.get("entity", "the record")
+            parts.append(
+                f"STAGE 2 - ASSIST: The user wants to update {entity} but did not provide a required value. "
+                f"After presenting any relevant context, ask for the missing information. "
+                f"Example: '{user_question}'"
+            )
+        else:
+            # Multiple missing slots — ask for all in one turn.
+            questions = [s.get("user_question", "Could you provide more details?") for s in unique_slots]
+            entities = sorted(set(s.get("entity", "the record") for s in unique_slots))
+            parts.append(
+                f"STAGE 2 - ASSIST: The user wants to update {', '.join(entities)} but did not provide "
+                f"required values for {len(unique_slots)} fields. After presenting any relevant context, "
+                f"ask for ALL missing information in a single turn (do not ask one at a time). "
+                f"Example: 'I have your leave entitlement above. To apply, I need: "
+                f"{'; '.join(questions)}'"
+            )
+    elif tone_context.get("chart_intent_clarification_needed"):
+        # Ambiguous chart/dashboard request detected by LLM classifier
+        reason = tone_context.get("chart_intent_clarification_reason", "your request could mean different things")
         parts.append(
+            f"STAGE 2 - ASSIST: The user's chart request is ambiguous ({reason}). "
+            f"Ask them to clarify EXACTLY what they want to see. "
+            f"Offer 2-3 specific options as a numbered list. "
+            f"Example: 'I can show you a single chart or a full dashboard. "
+            f"Would you like: (1) just headcount by department, "
+            f"(2) a full workforce overview with multiple charts, or "
+            f"(3) just the key numbers without charts? Which works best for you?'"
+        )
+    elif has_data and (action_oriented or category in ACTION_CATEGORIES):
+        stage2_guidance = _get_response_structure_guidance(
+            intent,
+            "stage2_has_data",
             "STAGE 2 - ASSIST: The user wants to take action or this is an action-oriented topic. "
             "After presenting the facts, suggest 1-3 relevant next actions they can take. "
             "Keep suggestions brief and tied to the data you just showed. "
@@ -39,6 +99,7 @@ def build_response_structure(category: str, has_data: bool, has_empty_result: bo
             "'Shall I check your manager's approval status?', "
             "'I can draft an email to HR if you'd like.'"
         )
+        parts.append(stage2_guidance)
     elif has_data and category in PERSONAL_DATA_CATEGORIES:
         parts.append(
             "STAGE 2 - ASSIST: After presenting personal data, suggest 1-2 relevant "
@@ -80,10 +141,13 @@ def build_response_structure(category: str, has_data: bool, has_empty_result: bo
             "and offering to escalate. 'Is this the right info? I can loop in HR now if needed.'"
         )
     elif action_oriented or category in ACTION_CATEGORIES:
-        parts.append(
+        stage3_guidance = _get_response_structure_guidance(
+            intent,
+            "stage3",
             "STAGE 3 - OFFER FEEDBACK: End by offering to help with the next step. "
             "'Ready when you are - just let me know what you'd like to do next.'"
         )
+        parts.append(stage3_guidance)
     else:
         parts.append(
             "STAGE 3 - OFFER FEEDBACK: End with an open invitation. "

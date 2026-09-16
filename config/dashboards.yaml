@@ -1,0 +1,247 @@
+# Named dashboard configurations.
+# Each dashboard contains an array of chart configs.
+dashboards:
+  executive_workforce:
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Headcount by Department"
+    - dataset: "V_EMP"
+      dimensions: ["GENDER"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "pie"
+      sort: "desc"
+      title: "Gender Distribution"
+    - dataset: "V_EMP"
+      dimensions: ["NATIONALITY_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Nationality Mix"
+    - dataset: "V_EMP"
+      dimensions: ["EMPLOYEE_STATUS"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "doughnut"
+      sort: "desc"
+      title: "Employment Status"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Grade Pyramid"
+    - dataset: "V_EMP"
+      dimensions: ["PAY_COUNTRY"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Headcount by Country"
+    - dataset: "V_EMP"
+      dimensions: ["POSITION_DESCRIPTION"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Top 10 Positions"
+    - dataset: "V_EMP"
+      dimensions: ["COMPANY_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "pie"
+      sort: "desc"
+      title: "Company Distribution"
+
+  headcount:
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Headcount by Department"
+    - dataset: "V_EMP"
+      dimensions: ["GENDER"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "pie"
+      sort: "desc"
+      title: "Gender Distribution"
+    - dataset: "V_EMP"
+      dimensions: ["NATIONALITY_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Nationality Mix"
+    - dataset: "V_EMP"
+      dimensions: ["EMPLOYEE_STATUS"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "doughnut"
+      sort: "desc"
+      title: "Employment Status"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Grade Pyramid"
+    - dataset: "V_EMP"
+      dimensions: ["PAY_COUNTRY"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Headcount by Country"
+
+  compensation:
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Department"
+    - dataset: "V_EMP"
+      dimensions: ["POSITION_DESCRIPTION"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Position"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Grade"
+    - dataset: "V_EMP"
+      dimensions: ["PAY_COUNTRY"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Country"
+    - dataset: "V_EMP"
+      dimensions: ["COMPANY_CODE"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Company"
+    - dataset: "V_EMP"
+      dimensions: ["HOURLY_RATE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Hourly Rate Distribution"
+
+  diversity:
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE", "GENDER"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Gender by Grade"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE", "NATIONALITY_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Nationality by Grade"
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE", "GENDER"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Gender by Department"
+    - dataset: "V_EMP"
+      dimensions: ["GENDER"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Gender"
+    - dataset: "V_EMP"
+      dimensions: ["NATIONALITY_CODE"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Nationality"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "HOURLY_RATE", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Hourly Rate by Grade"
+
+  turnover:
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      filter: "DATE_RESIGNED ne null"
+      chart_type: "bar"
+      sort: "desc"
+      title: "Terminations by Department"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      filter: "DATE_RESIGNED ne null"
+      chart_type: "bar"
+      sort: "desc"
+      title: "Terminations by Grade"
+    - dataset: "V_EMP"
+      dimensions: ["TENURE_BAND"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      filter: "DATE_RESIGNED ne null"
+      chart_type: "bar"
+      sort: "desc"
+      title: "Terminations by Tenure Band"
+    - dataset: "V_EMP"
+      dimensions: ["NATIONALITY_CODE"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      filter: "DATE_RESIGNED ne null"
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Terminations by Nationality"
+    - dataset: "V_EMP"
+      dimensions: ["POSITION_DESCRIPTION"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      filter: "DATE_RESIGNED ne null"
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Terminations by Position"
+    - dataset: "V_EMP"
+      dimensions: ["DATE_RESIGNED"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "line"
+      sort: "desc"
+      title: "Termination Trend (Monthly)"
+
+  retention:
+    - dataset: "V_EMP"
+      dimensions: ["DEPARTMENT_CODE"]
+      metrics: [{field: "DATE_JOINED", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Tenure by Department"
+    - dataset: "V_EMP"
+      dimensions: ["GRADE_CODE"]
+      metrics: [{field: "DATE_JOINED", agg: "avg"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Avg Tenure by Grade"
+    - dataset: "V_EMP"
+      dimensions: ["TENURE_BAND"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "bar"
+      sort: "desc"
+      title: "Tenure Distribution"
+    - dataset: "V_EMP"
+      dimensions: ["DATE_JOINED"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "line"
+      sort: "desc"
+      title: "Hiring Trend (Monthly)"
+    - dataset: "V_EMP"
+      dimensions: ["POSITION_DESCRIPTION"]
+      metrics: [{field: "DATE_JOINED", agg: "avg"}]
+      chart_type: "hbar"
+      sort: "desc"
+      title: "Avg Tenure by Position"
+    - dataset: "V_EMP"
+      dimensions: ["CONFIRMATION_STATUS"]
+      metrics: [{field: "EMPLOYEE_NO", agg: "count"}]
+      chart_type: "pie"
+      sort: "desc"
+      title: "Confirmation Status"

@@ -3,7 +3,11 @@
     "host": {
       "mode": "production",
       "authentication": {
-        "provider": "StaticWebApps"
+        "provider": "EntraID",
+        "jwt": {
+          "audience": "@env('DAB_ENTRA_AUDIENCE')",
+          "issuer": "@env('DAB_ENTRA_ISSUER')"
+        }
       },
       "cors": {
         "origins": [

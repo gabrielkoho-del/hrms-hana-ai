@@ -35,17 +35,17 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # ═════════════════════════════════════════════════════════════════════════════
 MODEL_TIERS = {
     "planner": {
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-3.5-flash",
         "temperature": 0.1,
         "max_tokens": 8192,
     },
     "executor": {
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-3.5-flash",
         "temperature": 0.1,
         "max_tokens": 8192,
     },
     "responder": {
-        "model": "gemini-3.1-flash-lite",
+        "model": "gemini-3.5-flash",
         "temperature": 0.3,
         "max_tokens": 8192,
     },

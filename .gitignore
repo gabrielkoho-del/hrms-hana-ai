@@ -37,3 +37,17 @@ hana-mcp-server/coverage/
 
 # Design assets (per your request)
 workflow_*.png
+dashboard-review.png
+
+# Frontend (ui/)
+ui/node_modules/
+ui/dist/
+
+# Test files
+test_*.py
+
+# Debug scripts
+debug_*.py
+
+# Playwright MCP
+.playwright-mcp/

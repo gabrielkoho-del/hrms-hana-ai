@@ -15,6 +15,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.integrations.hana_client import is_hana_available
+
 logger = logging.getLogger("hr_agent")
 
 
@@ -212,6 +214,15 @@ class SchemaRegistryService:
         """Return the registry for the given tenant, loading/reloading on demand if needed."""
         tenant_key = tenant_id.upper()
         if tenant_key not in self._registries or self._is_stale(tenant_key):
+            # If HANA is known to be down, don't attempt a live discovery -- just
+            # serve whatever is cached (possibly empty) to avoid connection
+            # retries on every user query.
+            if not is_hana_available():
+                logger.info(
+                    "SchemaRegistry: HANA unavailable -- skipping live discovery for tenant=%s",
+                    tenant_id,
+                )
+                return self._registries.get(tenant_key, {})
             return self.load_tenant(tenant_id)
         return self._registries[tenant_key]
 
@@ -342,6 +353,10 @@ class SchemaRegistryService:
         async def _refresh_loop() -> None:
             while True:
                 await asyncio.sleep(interval)
+                # If HANA is known to be down, skip the live diff entirely so we
+                # don't retry connections against a dead server every interval.
+                if not is_hana_available():
+                    continue
                 for tenant_id in tenant_ids:
                     tenant_key = tenant_id.upper()
                     async with self._refresh_lock:

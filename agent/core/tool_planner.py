@@ -45,12 +45,9 @@ from agent.hana.temporal import (
     resolve_temporal_context,
 )
 from agent.hana.semantic import format_hana_semantics_for_prompt
-from agent.output.chart_metadata import extract_metrics_hybrid
-from agent.output.binning import (
-    BINNING_MAP,
-    _resolve_binning_column,
-    _derive_y_label,
-)
+from agent.actions.strategies.leave_entitlement_guard import ensure_leave_entitlement_entity
+from agent.output.chart_planner import infer_metadata, classify_chart_intent
+from agent.actions import inject_all_actions
 
 logger = logging.getLogger("hr_agent")
 
@@ -183,17 +180,27 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
                         "description": "Fields to group by"
                     },
                     "orderby": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Sort fields"
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "description": "Sort direction for grouped results by aggregated value (requires groupby; default desc)"
                     },
                     "filter": {
                         "type": "string",
                         "description": "OData filter expression"
                     },
                     "having": {
-                        "type": "string",
-                        "description": "Having clause for group filtering"
+                        "type": "object",
+                        "description": "Filter groups by aggregated value. Operators: eq, neq, gt, gte, lt, lte, in. Requires groupby.",
+                        "properties": {
+                            "eq": {"type": "number"},
+                            "neq": {"type": "number"},
+                            "gt": {"type": "number"},
+                            "gte": {"type": "number"},
+                            "lt": {"type": "number"},
+                            "lte": {"type": "number"},
+                            "in": {"type": "array", "items": {"type": "number"}}
+                        },
+                        "additionalProperties": False,
                     },
                     "first": {
                         "type": "string",
@@ -228,152 +235,6 @@ def build_hana_tool_schemas(tenant_id: Optional[str] = None) -> List[Dict]:
     falls back to the static schema list.
     """
     return get_cached_hana_tool_schemas(tenant_id=tenant_id)
-
-
-def build_superset_tool_schemas() -> List[Dict]:
-    """Build OpenAI function-calling schemas for Superset MCP dashboard tools."""
-    list_datasets_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_list_datasets",
-            "description": "List available Superset datasets. Use to discover what data sources are available for dashboard building.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filters": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "Optional filters to narrow dataset list (e.g., by table_name containing 'hr')"
-                    }
-                },
-                "required": []
-            }
-        }
-    }
-
-    get_dataset_info_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_get_dataset_info",
-            "description": "Get schema, columns, and metadata for a specific Superset dataset. Use after selecting a dataset to understand available metrics and dimensions.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dataset_id": {
-                        "type": "integer",
-                        "description": "ID of the dataset to inspect"
-                    }
-                },
-                "required": ["dataset_id"]
-            }
-        }
-    }
-
-    generate_chart_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_generate_chart",
-            "description": "Generate a chart preview or save it to Superset. Use save_chart=False for preview, save_chart=True to persist. Returns explore_url for preview and chart_id when saved.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dataset_id": {"type": "integer", "description": "Dataset to query"},
-                    "viz_type": {"type": "string", "description": "Chart type: bar, line, pie, big_number, table, etc."},
-                    "metrics": {"type": "array", "items": {"type": "string"}, "description": "Metrics to plot"},
-                    "groupby": {"type": "array", "items": {"type": "string"}, "description": "Dimensions to group by"},
-                    "filters": {"type": "array", "items": {"type": "object"}, "description": "Superset filter config"},
-                    "save_chart": {"type": "boolean", "description": "True to persist chart, False for preview only"},
-                    "chart_name": {"type": "string", "description": "Name for saved chart"}
-                },
-                "required": ["dataset_id", "viz_type"]
-            }
-        }
-    }
-
-    generate_dashboard_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_generate_dashboard",
-            "description": "Build a Superset dashboard from saved chart IDs with auto-layout. Use only after user confirms previewed charts.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dashboard_title": {"type": "string", "description": "Title for the new dashboard"},
-                    "charts": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": "List of chart specs or saved chart IDs"
-                    },
-                    "auto_layout": {"type": "boolean", "description": "Use automatic grid layout"},
-                    "layout_mode": {"type": "string", "description": "Layout mode: grid or free_form"},
-                    "description": {"type": "string", "description": "Dashboard description"}
-                },
-                "required": ["dashboard_title"]
-            }
-        }
-    }
-
-    execute_sql_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_execute_sql",
-            "description": "Execute SQL against a Superset dataset or database. Use for ad-hoc queries when pre-built datasets are insufficient.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "SQL query to execute"},
-                    "dataset_id": {"type": "integer", "description": "Optional dataset context"},
-                    "limit": {"type": "integer", "description": "Max rows to return"}
-                },
-                "required": ["query"]
-            }
-        }
-    }
-
-    create_virtual_dataset_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_create_virtual_dataset",
-            "description": "Create a virtual dataset in Superset from a SQL query. Use when existing datasets don't expose the needed metrics.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Dataset name"},
-                    "sql": {"type": "string", "description": "SQL query defining the dataset"},
-                    "schema": {"type": "string", "description": "Database schema"},
-                    "database_id": {"type": "integer", "description": "Superset database ID"}
-                },
-                "required": ["name", "sql"]
-            }
-        }
-    }
-
-    add_chart_to_existing_dashboard_schema = {
-        "type": "function",
-        "function": {
-            "name": "superset_add_chart_to_existing_dashboard",
-            "description": "Add an already-saved chart to an existing dashboard.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dashboard_id": {"type": "integer", "description": "Target dashboard ID"},
-                    "chart_id": {"type": "integer", "description": "Chart to add"},
-                    "position": {"type": "object", "description": "Optional position config"}
-                },
-                "required": ["dashboard_id", "chart_id"]
-            }
-        }
-    }
-
-    return [
-        list_datasets_schema,
-        get_dataset_info_schema,
-        generate_chart_schema,
-        generate_dashboard_schema,
-        execute_sql_schema,
-        create_virtual_dataset_schema,
-        add_chart_to_existing_dashboard_schema,
-    ]
 
 
 # =============================================================================
@@ -417,33 +278,21 @@ def validate_tool_args(tool_name: str, args: Dict[str, Any]) -> Optional[str]:
         return f"Invalid arguments for {tool_name}: {e.message}"
 
 
-def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True, tenant_id: Optional[str] = None, include_superset: bool = True) -> List[Dict]:
-    """Merge DAB, HANA, and Superset tool schemas for the planner prompt.
+def build_all_tool_schemas(cached_schema: Dict, include_hana: bool = True, tenant_id: Optional[str] = None) -> List[Dict]:
+    """Merge DAB and HANA tool schemas for the planner prompt.
 
     Args:
         cached_schema: DAB entity schema map.
         include_hana: If True, append HANA schemas (requires HANA server reachable).
         tenant_id: Tenant identifier for HANA tool cache lookup.
-        include_superset: If True, append Superset dashboard schemas.
     """
     schemas = list(build_dab_tool_schemas(cached_schema))
     if include_hana:
         schemas.extend(build_hana_tool_schemas(tenant_id=tenant_id))
-    if include_superset:
-        schemas.extend(build_superset_tool_schemas())
     return schemas
 
 
-_ALL_DAB_TOOLS = {"read_records", "aggregate_records", "describe_entities"}
-_ALL_SUPERSET_TOOLS = {
-    "superset_list_datasets",
-    "superset_get_dataset_info",
-    "superset_generate_chart",
-    "superset_generate_dashboard",
-    "superset_execute_sql",
-    "superset_create_virtual_dataset",
-    "superset_add_chart_to_existing_dashboard",
-}
+_ALL_DAB_TOOLS = {"read_records", "aggregate_records", "describe_entities", "create_record", "update_record"}
 
 
 def extract_steps_from_tool_calls(
@@ -467,7 +316,7 @@ def extract_steps_from_tool_calls(
             for s in hana_schemas
             if isinstance(s, dict) and s.get("function", {}).get("name")
         }
-        allowed_tools = _ALL_DAB_TOOLS | hana_tools | _ALL_SUPERSET_TOOLS
+        allowed_tools = _ALL_DAB_TOOLS | hana_tools
 
     steps = []
     for tc in tool_calls:
@@ -531,258 +380,114 @@ def _normalize_entity_names(steps: List[Dict], cached_schema: Dict) -> List[Dict
 
 
 # =============================================================================
-# METADATA INFERENCE -- Heuristic chart/rag/binning from query + steps
+# METADATA INFERENCE -- delegated to agent.output.chart_planner
 # =============================================================================
 
-# Chart intent patterns using word boundaries to avoid false positives
-# (e.g., "chartroom" should not match "chart").
-_CHART_TYPE_PATTERNS = [
-    (re.compile(r"\bbar\s+(chart|graph|plot)\b", re.I), "bar"),
-    (re.compile(r"\bcolumn\s+(chart|graph|plot)\b", re.I), "bar"),
-    (re.compile(r"\bpie\s+(chart|graph|plot|donut)\b", re.I), "pie"),
-    (re.compile(r"\bline\s+(chart|graph|plot|trend|time\s*series)\b", re.I), "line"),
-    (re.compile(r"\bhistogram\b|\bhist\s+chart\b|\bdistribution\s+chart\b", re.I), "hist"),
-    (re.compile(r"\bbox\s*plot\b|\bbox\s*chart\b|\bboxplot\b", re.I), "box"),
-    (re.compile(r"\bgauge\s+chart\b|\bkpi\s+gauge\b|\bgauge\b", re.I), "gauge"),
-]
 
-# General chart intent: user wants a visual representation, but didn't specify type.
-# Uses word boundaries to avoid matching "chartroom", "epicchart", etc.
-_GENERAL_CHART_PATTERN = re.compile(
-    r"\b(chart|graph|visualize|visualization|plot|dashboard|kpi)\b",
-    re.I,
-)
+def _build_dashboard_steps_from_queries(
+    dashboard_queries: List[Dict],
+    hana_schema_registry: Optional[Dict[str, List[str]]] = None,
+) -> List[Dict]:
+    """Convert named-dashboard chart configs into execution steps.
 
-
-def _detect_chart_intent(user_query: str) -> Dict[str, Any]:
-    """Detect chart intent from user query using regex with word boundaries.
-
-    Returns dict with:
-      - explicit_chart_type: str or None
-      - general_chart_intent: bool
+    For V_EMP (DAB): generates aggregate_records steps.
+    For HANA tables: generates hana_execute_query steps.
+    Replaces the LLM's generic schema-discovery steps with actual data retrieval.
     """
-    query_lower = user_query.lower()
-    explicit_chart_type = None
-    for pattern, chart_type in _CHART_TYPE_PATTERNS:
-        if pattern.search(query_lower):
-            explicit_chart_type = chart_type
-            break
+    if not dashboard_queries:
+        return []
 
-    general_chart_intent = bool(_GENERAL_CHART_PATTERN.search(query_lower))
-    return {
-        "explicit_chart_type": explicit_chart_type,
-        "general_chart_intent": general_chart_intent,
-    }
+    registry = hana_schema_registry or {}
+    steps: List[Dict] = []
 
+    for q in dashboard_queries:
+        dataset = q.get("dataset", "")
+        dimensions = q.get("dimensions", [])
+        metrics = q.get("metrics", [])
+        chart_filter = q.get("filter") or ""
+        sort = q.get("sort", "desc")
 
-async def infer_metadata(user_query: str, steps: List[Dict], tone_context: Optional[Dict]) -> Dict:
-    """Infer chart, RAG, client-side binning, and other metadata from query and steps.
+        if not metrics:
+            continue
 
-    Uses hybrid metric extraction: fast regex gate + LLM fallback with TTL cache.
-    """
-    metadata = {
-        "chart": None,
-        "rag": False,
-        "rag_query": "",
-        "needs_export": False,
-        "action_context": "",
-        "client_side_binning": None,
-        "reasoning": "",
-    }
+        metric = metrics[0]
+        metric_field = metric.get("field", "")
+        metric_agg = metric.get("agg", "count")
 
-    query_lower = user_query.lower()
-    tone_context = tone_context or {}
-    category = tone_context.get("intent_category", "policy_info")
+        # Determine if this is a HANA dataset (check against registered HANA tables)
+        is_hana = False
+        if registry:
+            is_hana = any(dataset.upper() == t.upper() for tables in registry.values() for t in tables)
 
-    has_aggregate = any(s["tool"] == "aggregate_records" for s in steps)
-    has_read = any(s["tool"] == "read_records" for s in steps)
-    has_hana = any(s["tool"].startswith("hana_") for s in steps)
-
-    # Detect explicit chart type request from user query (must happen before HANA early return)
-    chart_intent = _detect_chart_intent(user_query)
-    explicit_chart_type = chart_intent["explicit_chart_type"]
-    general_chart_intent = chart_intent["general_chart_intent"]
-    if explicit_chart_type:
-        logger.info("Planner: explicit chart type detected from query: %s", explicit_chart_type)
-
-    # Also treat tone_context chart_eligible=True as implicit chart intent.
-    tone_context = tone_context or {}
-    chart_eligible = tone_context.get("chart_eligible", False)
-    if not general_chart_intent and chart_eligible and has_hana:
-        general_chart_intent = True
-
-    # Detect multi-metric financial report intent using hybrid extraction.
-    unique_metrics = await extract_metrics_hybrid(user_query)
-    is_multi_metric = len(unique_metrics) >= 2
-    if is_multi_metric:
-        logger.info("Planner: multi-metric report detected: %s", unique_metrics)
-
-    # HANA queries use raw SQL; skip DAB chart/binning metadata inference
-    # BUT preserve explicit chart requests so executor can still generate the chart
-    if has_hana and not has_aggregate and not has_read:
-        metadata["reasoning"] = f"Selected {len(steps)} HANA tool(s) for direct SQL query."
-        if explicit_chart_type or general_chart_intent:
-            chart_type = explicit_chart_type or "bar"
-            metadata["chart"] = {
-                "type": chart_type,
-                "x_column": "",
-                "y_column": "",
-                "y_label": "",
-                "title": "",
-                "gauge_min": 0 if chart_type == "gauge" else None,
-                "gauge_max": 100 if chart_type == "gauge" else None,
-                "gauge_threshold": 70 if chart_type == "gauge" else None,
-                "trend_line": chart_type == "line" and any(kw in query_lower for kw in ("trend line", "trend", "with trend")),
-                "multi_series": is_multi_metric,
-                "metrics": unique_metrics if is_multi_metric else [],
+        if is_hana:
+            # HANA: build SQL query
+            agg_expr = f"{metric_agg.upper()}({metric_field})" if metric_agg != "count" else "COUNT(*)"
+            dim_cols = ", ".join(dimensions) if dimensions else "*"
+            groupby_clause = f" GROUP BY {dim_cols}" if dimensions else ""
+            order_clause = f" ORDER BY 1 DESC" if sort == "desc" and groupby_clause else ""
+            filter_clause = f" WHERE {chart_filter}" if chart_filter else ""
+            sql = f"SELECT {dim_cols}, {agg_expr} AS m FROM {dataset}{filter_clause}{groupby_clause}{order_clause} LIMIT 50"
+            steps.append({"tool": "hana_execute_query", "args": {"query": sql}})
+        else:
+            # DAB: build aggregate_records step
+            agg_func = metric_agg if metric_agg in ("count", "sum", "avg", "min", "max") else "count"
+            agg_field = metric_field if agg_func != "count" else "*"
+            # DAB aggregate_records 'orderby' is a direction string ("asc"/"desc")
+            # that defaults to "desc" when omitted (verified against shipped DAB
+            # source AggregateRecordsTool.cs; the docs' array format is a
+            # read_records-only convention). Dashboard configs want descending
+            # sort, which matches the server default, so orderby is omitted for
+            # "desc" and only sent explicitly for non-default sorts.
+            orderby: Optional[str] = "asc" if sort == "asc" else None
+            step_args: Dict[str, Any] = {
+                "entity": dataset,
+                "function": agg_func,
+                "field": agg_field,
+                "groupby": dimensions,
+                "first": "50",
             }
-        return metadata
+            if orderby:
+                step_args["orderby"] = orderby
+            if chart_filter:
+                step_args["filter"] = chart_filter
+            steps.append({"tool": "aggregate_records", "args": step_args})
 
-    # -- Chart inference (intent category + data shape, NOT keywords) --
-    chart_eligible = tone_context.get("chart_eligible", False) if tone_context else False
-
-    # Must also have aggregate step with groupby OR read_records with 2-column select
-    has_aggregate_with_groupby = any(
-        s["tool"] == "aggregate_records" and s.get("args", {}).get("groupby")
-        for s in steps
-    )
-    has_read_with_2col = any(
-        s["tool"] == "read_records" and
-        len([f for f in (s.get("args", {}).get("select", "") or "").split(",") if f.strip()]) == 2
-        for s in steps
-    )
-    has_groupby_like = has_aggregate_with_groupby or has_read_with_2col
-
-    # Row count guard: 1-5 rows = no chart (too small), 6-50 = chart, 50+ = chart + export
-    # We don't know row count yet, so we plan the chart and let executor decide later
-    wants_chart = chart_eligible and has_groupby_like
-
-    if wants_chart:
-        chart_type = "bar"
-        x_col = ""
-        y_col = ""
-        title = "Distribution"
-        y_label = ""
-
-        for step in steps:
-            if step["tool"] == "aggregate_records":
-                args = step.get("args", {})
-                groupby = args.get("groupby", [])
-                if groupby:
-                    x_col = groupby[-1]  # Most granular
-
-                func = args.get("function", "count")
-                field = args.get("field", "")
-                y_col = "count" if func == "count" else (field or "value")
-                y_label = _derive_y_label(func, args.get("entity", ""), field)
-
-                groupby_count = len(groupby)
-                if explicit_chart_type:
-                    chart_type = explicit_chart_type
-                elif groupby_count == 0:
-                    chart_type = "hist" if func == "count" else "bar"
-                elif groupby_count == 1:
-                    cat_col = groupby[0]
-                    if func == "count" and any(suffix in cat_col for suffix in ["_group", "_range", "_band"]):
-                        chart_type = "bar"
-                    elif any(dim in cat_col for dim in ["year", "month", "quarter"]):
-                        chart_type = "line"
-                    elif func == "count":
-                        # Small categorical -> pie; let executor decide based on row count
-                        chart_type = "pie"
-                    else:
-                        chart_type = "bar"
-                elif groupby_count >= 2:
-                    chart_type = "bar"  # Multi-series grouped bar (matplotlib only)
-
-                # Add filter context to title
-                having = args.get("having", "")
-                filter_str = args.get("filter", "")
-                context_suffix = ""
-                if having:
-                    context_suffix = f" (filtered: {having})"
-                elif filter_str:
-                    context_suffix = " (filtered)"
-                title = f"{x_col.replace('_', ' ').title()} Distribution{context_suffix}" if x_col else "Distribution"
-                break
-
-        metadata["chart"] = {
-            "type": chart_type,
-            "x_column": x_col,
-            "y_column": y_col,
-            "y_label": y_label,
-            "title": title,
-            "gauge_min": 0 if chart_type == "gauge" else None,
-            "gauge_max": 100 if chart_type == "gauge" else None,
-            "gauge_threshold": 70 if chart_type == "gauge" else None,
-            "trend_line": chart_type == "line" and any(kw in query_lower for kw in ("trend line", "trend", "with trend")),
-        }
-
-    # -- Dashboard inference (Superset dashboard building) --
-    has_superset_dashboard = any(s["tool"] == "superset_generate_dashboard" for s in steps)
-    has_superset_chart = any(s["tool"] == "superset_generate_chart" for s in steps)
-    has_superset_dataset = any(s["tool"] in ("superset_list_datasets", "superset_get_dataset_info") for s in steps)
-
-    if category == "dashboard_building" or has_superset_dashboard or has_superset_chart:
-        metadata["dashboard_build"] = {
-            "has_superset_dashboard": has_superset_dashboard,
-            "has_superset_chart": has_superset_chart,
-            "has_superset_dataset": has_superset_dataset,
-            "pending_preview_charts": [],
-            "confirmed_chart_ids": [],
-            "dashboard_title": user_query[:80],
-        }
-        logger.info("Planner: dashboard_build metadata inferred (category=%s, dashboard=%s, chart=%s, dataset=%s)",
-                     category, has_superset_dashboard, has_superset_chart, has_superset_dataset)
-
-    # -- RAG inference --
-    rag_keywords = ["policy", "rule", "handbook", "procedure", "guideline", "entitled", "eligible", "how do i", "how to"]
-    if any(kw in query_lower for kw in rag_keywords) or category == "policy_info":
-        metadata["rag"] = True
-        metadata["rag_query"] = user_query
-
-    # -- Export intent inference --
-    export_keywords = ("export", "download", "save", "excel", "spreadsheet",
-                         "xlsx", "workbook", "file", "send me", "give me the data")
-    wants_export = (
-        any(kw in query_lower for kw in export_keywords)
-        and category == "aggregate_data"
-        and (has_aggregate or has_read)
-    )
-    if wants_export:
-        metadata["needs_export"] = True
-
-    # -- Client-side binning inference --
-    if has_aggregate:
-        for step in steps:
-            if step["tool"] == "aggregate_records":
-                args = step.get("args", {})
-                groupby = args.get("groupby", [])
-                if len(groupby) == 1:
-                    raw_col = groupby[0]
-                    canonical = _resolve_binning_column(raw_col)
-                    if canonical:
-                        bin_config = dict(BINNING_MAP[canonical]["config"])
-                        bin_config["column"] = raw_col
-                        metadata["client_side_binning"] = bin_config
-                        logger.info("infer_metadata: resolved binning for '%s' -> canonical '%s'", raw_col, canonical)
-
-    # -- Action context --
-    metadata["action_context"] = tone_context.get("action_context", "")
-
-    # -- Reasoning --
-    metadata["reasoning"] = (
-        f"Selected {len(steps)} tool(s) based on query intent ({category}). "
-        f"Chart={'yes' if metadata['chart'] else 'no'}, RAG={'yes' if metadata['rag'] else 'no'}, "
-        f"Export={'yes' if metadata['needs_export'] else 'no'}."
-    )
-
-    return metadata
+    return steps
 
 
 # =============================================================================
 # SYSTEM PROMPTS
 # =============================================================================
+
+def _empty_plan(pending_slots: Optional[List[Dict]] = None) -> Dict:
+    """Empty plan returned when no cached tools or no steps were produced.
+
+    Mirrors the full plan shape (see the plan dict built at the end of
+    build_tool_plan) so downstream consumers never need special-casing.
+
+    Args:
+        pending_slots: Optional list of pending slot dicts from action injection.
+            Preserved so the executor can surface clarification questions even
+            when the LLM produced no tool-call steps.
+    """
+    return {
+        "steps": [],
+        "direct_answer": "",
+        "chart": None,
+        "rag": False,
+        "rag_query": "",
+        "needs_export": False,
+        "reasoning": "No tool steps produced",
+        "action_context": "",
+        "client_side_binning": None,
+        "chart_intent_clarification_needed": False,
+        "chart_intent_clarification_reason": "",
+        "kpi_only": False,
+        "multi_chart": False,
+        "dashboard_queries": [],
+        "pending_slots": pending_slots or [],
+    }
+
 
 async def build_tool_plan(
     user_query: str,
@@ -825,6 +530,32 @@ async def build_tool_plan(
             "client_side_binning": None,
         }
         return plan
+    # =======================================================================
+    # CHART INTENT CLASSIFICATION -- structured LLM-based multi-chart detection
+    # Runs early so tone_context["chart_intent"] is available to infer_metadata.
+    # =======================================================================
+    if tone_context is None:
+        tone_context = {}
+    chart_intent_result = await classify_chart_intent(
+        user_query,
+        conversation_history=conversation_history,
+        tone_context=tone_context,
+        tenant_id=tenant_id,
+    )
+    tone_context = dict(tone_context)  # Don't mutate caller's dict
+    tone_context["chart_intent"] = chart_intent_result
+    if chart_intent_result.needs_clarification:
+        logger.info(
+            "Chart intent: %s (confidence=%.2f) -- clarification recommended: %s",
+            chart_intent_result.intent, chart_intent_result.confidence,
+            chart_intent_result.clarification_reason,
+        )
+    else:
+        logger.info(
+            "Chart intent: %s (confidence=%.2f)",
+            chart_intent_result.intent, chart_intent_result.confidence,
+        )
+
     schema_block = await format_schema_for_prompt_cached(
         cached_schema, tenant_id=tenant_id, user_query=user_query
     )
@@ -914,10 +645,11 @@ async def build_tool_plan(
         logger.info("Planner: LLM returned no tool calls")
 
     steps = []
+    pending_slots: List[Dict] = []
     if choice and choice.get("message", {}).get("tool_calls"):
         steps = extract_steps_from_tool_calls(choice["message"]["tool_calls"], tool_schema_map=tool_schema_map, tenant_id=tenant_id)
         steps = _normalize_entity_names(steps, cached_schema)
-        logger.info("Planner: Tool calling produced %d steps: %s", len(steps), [s["tool"] for s in steps])
+        logger.info("Planner: Tool calling produced %d steps: %s", len(steps), [s.get("tool", "unknown") for s in steps])
 
         # -- SQL validation and semantic-template repair ---------------------
         validated_steps = []
@@ -939,9 +671,115 @@ async def build_tool_plan(
             validated_steps.append(step)
         steps = validated_steps
 
+        # -- Leave action injection is handled by inject_all_actions below --
+
+        # -- Leave entitlement query guard -- ensures entitlement/balance questions
+        # actually query a leave-entitlement entity (not generic V_EMP profile).
+        # Skips for action requests (which use create/update) unless it's leave_request.
+        steps = ensure_leave_entitlement_entity(
+            steps,
+            user_query,
+            auth_context,
+            cached_schema,
+            cached_tools=cached_tools,
+            tone_context=tone_context,
+            tenant_id=tenant_id,
+        )
+
+        # -- Unified Action Framework -- handles entity-specific action injection
+        # for entities registered in config/entity_actions.yaml.
+        # Currently covers: employee_general (simple_update)
+        # Delegates to strategy-specific injectors (simple_update_strategy, leave_strategy, etc.)
+        #
+        # Returns (steps, pending_slots) where pending_slots surfaces fields that need
+        # clarification. The LLM/planner decides whether to ask or skip — not the injector.
+        #
+        # Warm the CodeResolver cache before action injection so leave-type
+        # description matching (e.g. "Annual Leave" -> "ANL") resolves against
+        # fresh codesetup rather than a stale/hardcoded fallback.
+        try:
+            from agent.dab.code_resolver import CodeResolver
+            await CodeResolver(tenant_id).get_reverse_index()
+        except Exception as _warm_exc:
+            logger.debug("build_tool_plan: CodeResolver warm failed (non-fatal): %s", _warm_exc)
+
+        steps, pending_slots = inject_all_actions(
+            steps,
+            user_query,
+            auth_context,
+            cached_schema,
+            cached_tools=cached_tools,
+            tone_context=tone_context,
+            tenant_id=tenant_id,
+            conversation_history=conversation_history,
+        )
+
+    # -- Action-domain clarification gate --
+    # When inject_all_actions returned pending_slots but produced no write steps
+    # (create/update), the LLM likely misclassified the query as kpi_only or
+    # read-only. The planner must ask for clarification rather than silently
+    # proceeding with the wrong intent.
+    if pending_slots:
+        write_tools = {"create_record", "update_record", "delete_record"}
+        has_write_step = any(s.get("tool") in write_tools for s in steps)
+        if not has_write_step:
+            # Build a human-readable reason from the pending slot details
+            slot_summaries = [
+                f"{p.get('entity', '?')}.{p.get('field', '?')}"
+                for p in pending_slots
+                if isinstance(p, dict)
+            ]
+            clarification_reason = (
+                f"Action intent detected but required fields missing: {', '.join(slot_summaries)}. "
+                f"The query may have been misclassified — clarification needed."
+            )
+            tone_context["chart_intent_clarification_needed"] = True
+            tone_context["chart_intent_clarification_reason"] = clarification_reason
+            logger.info(
+                "Action clarification: pending_slots=%s (no write steps produced)",
+                slot_summaries,
+            )
+
+    # Propagate chart intent clarification need into tone_context so the summarizer
+    # can generate an appropriate clarification question before any steps execute.
+    if chart_intent_result.needs_clarification:
+        tone_context["chart_intent_clarification_needed"] = True
+        tone_context["chart_intent_clarification_reason"] = chart_intent_result.clarification_reason
+        logger.info(
+            "Chart intent clarification: %s (confidence=%.2f)",
+            chart_intent_result.clarification_reason, chart_intent_result.confidence,
+        )
+
+    # Surface pending_slots to tone_context so the LLM sees them in the next turn.
+    # pending_slots contain {entity, field, code_type, user_question} for fields
+    # that were mentioned but not yet provided. The planner/LLM decides to ask or skip.
+    if pending_slots:
+        tone_context["pending_slots"] = pending_slots
+        logger.info(
+            "Planner: pending_slots from action injection: %s",
+            [{"entity": p["entity"], "field": p["field"]} for p in pending_slots]
+        )
+
     if steps:
         # Infer metadata from query + steps (deterministic, no extra API call)
-        metadata = await infer_metadata(user_query, steps, tone_context)
+        metadata = await infer_metadata(user_query, steps, tone_context, tenant_id)
+
+        # -- Named dashboard injection -- when a named dashboard is matched,
+        # dashboard_queries replaces the LLM's generic steps (e.g. hana_list_schemas)
+        # with structured data-retrieval steps for each chart.
+        dashboard_queries = metadata.get("dashboard_queries")
+        if dashboard_queries:
+            dashboard_steps = _build_dashboard_steps_from_queries(
+                dashboard_queries,
+                hana_schema_registry=hana_schema_registry,
+            )
+            if dashboard_steps:
+                logger.info(
+                    "Planner: named dashboard matched -- replaced %d LLM steps with %d dashboard query steps",
+                    len(steps),
+                    len(dashboard_steps),
+                )
+                steps = dashboard_steps
 
         # Native tool calling provides structured tool_calls; metadata comes from infer_metadata
 
@@ -955,6 +793,12 @@ async def build_tool_plan(
             "reasoning": metadata.get("reasoning", "Native tool calling from LLM"),
             "action_context": metadata.get("action_context", ""),
             "client_side_binning": metadata.get("client_side_binning"),
+            "chart_intent_clarification_needed": metadata.get("chart_intent_clarification_needed", False) or tone_context.get("chart_intent_clarification_needed", False),
+            "chart_intent_clarification_reason": metadata.get("chart_intent_clarification_reason", "") or tone_context.get("chart_intent_clarification_reason", ""),
+            "kpi_only": metadata.get("kpi_only", False),
+            "multi_chart": metadata.get("multi_chart", False),
+            "dashboard_queries": metadata.get("dashboard_queries", []),
+            "pending_slots": pending_slots,
         }
 
         # =======================================================================
@@ -976,4 +820,4 @@ async def build_tool_plan(
 
     # No tool steps produced by the model. Treat as empty plan rather than silently degraded JSON parsing.
     logger.warning("Planner: native tool calling produced no steps. Returning empty plan.")
-    return _empty_plan()
+    return _empty_plan(pending_slots=pending_slots)

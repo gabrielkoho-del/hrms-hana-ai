@@ -52,7 +52,14 @@ from agent.core.intent_config import (
     get_affirmative_keywords,
 )
 from agent.integrations.llm_client import call_llm
-from agent.integrations.schema_index import EMBEDDING_MODEL, EMBEDDING_DIM, _get_embed_client
+from agent.integrations.hana_client import is_hana_available
+from agent.integrations.embedding import (
+    BaseEmbeddingIndex,
+    EMBEDDING_MODEL,
+    EMBEDDING_DIM,
+    _embed_texts_with_provider,
+    stable_hash,
+)
 
 logger = logging.getLogger("hr_agent")
 
@@ -67,17 +74,6 @@ _BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 
 _INTENT_EXEMPLAR_CACHE_DIR = Path(os.getenv('INTENT_EXEMPLAR_CACHE_DIR', 'data/intent_exemplar_cache'))
 _FINANCE_CONFIG_PATH = os.path.join(_BASE_DIR, "config", "finance_config.yaml")
-
-def _intent_exemplar_hash(exemplars):
-    "Stable hash for exemplar dict."
-    def _stable_dump(obj):
-        if isinstance(obj, dict):
-            return {k: _stable_dump(v) for k, v in sorted(obj.items())}
-        if isinstance(obj, list):
-            return sorted((_stable_dump(item) for item in obj), key=str)
-        return obj
-    return hashlib.md5(json.dumps(_stable_dump(exemplars), default=str).encode()).hexdigest()[:16]
-
 
 def _load_finance_config() -> Dict:
     """Load finance table configuration from YAML file."""
@@ -128,176 +124,217 @@ class IntentResult:
     wants_export: bool = False       # True if user explicitly asks to export/download data
     is_ambiguous: bool = False       # True if user's affirmation is ambiguous (multiple prior options)
     finance_query: bool = False      # True if query involves SAP FI/CO finance data
-    forecasting_query: bool = False  # True if query asks for forecasting/prediction/trend
+    forecasting_query: bool = False   # True if query asks for forecasting/prediction/trend
+
+
+@dataclass
+class ChartIntentResult:
+    """Structured result of a chart/dashboard intent classification.
+
+    Produced by classify_chart_intent() and stored in tone_context["chart_intent"].
+    """
+    intent: str                          # "single_chart" | "multi_chart" | "modify_existing" | "kpi_only"
+    confidence: float                    # 0.0-1.0
+    charts: List[Dict]                  # detected (dimension, metric) pairs as [{dimension, metric, chart_type}, ...]
+    needs_clarification: bool           # True when confidence is low and clarification is needed
+    clarification_reason: str              # Human-readable reason for the clarification need
+    raw_classification: Dict             # Full LLM output for debugging / audit
 
 
 # =======================================================================
 # EXEMPLAR INDEX -- embedding-based intent retrieval with Jaccard fallback
 # =======================================================================
 
-class IntentExemplarIndex:
-    """Lightweight index for embedding-based exemplar retrieval.
+class IntentExemplarIndex(BaseEmbeddingIndex):
+    """Lightweight index for embedding-based intent exemplar retrieval.
 
-    Primary path: embed exemplar texts and query via Gemini, cosine similarity.
+    Primary path: embed exemplar texts and query via cosine similarity.
     Fallback: Jaccard token overlap if embedding API is unavailable.
+
+    Inherits cache + build + load lifecycle from `BaseEmbeddingIndex`.
+    The intent-specific behavior is:
+      - `_texts_to_embed()` flattens all exemplars and tracks per-intent ranges
+      - `_save_cache` / `_restore_from_cache` persist per-intent groupings
+      - `search()` falls back to Jaccard if embedding path fails
     """
 
-    def __init__(self, exemplars: Dict[str, List[str]]):
+    cache_prefix = "intent"
+    cache_dir = _INTENT_EXEMPLAR_CACHE_DIR
+
+    def __init__(self, exemplars: Dict[str, List[str]], tenant_id: str = "default"):
+        super().__init__(tenant_id=tenant_id)
         self.exemplars = exemplars
         self._intent_embeddings: Dict[str, np.ndarray] = {}
         self._intent_token_sets: Dict[str, List[Set[str]]] = {}
         self._all_intents: List[str] = []
-        self._all_embeddings: Optional[np.ndarray] = None
-        self.embedding_dim: int = 768
-        self.embedding_provider: str = "gemini"
         self._built = False
         self._use_embeddings = True
 
-    async def build(self) -> None:
-        """Build index. Tries embeddings first, falls back to Jaccard."""
-        if self._built:
-            return
-        # Try disk cache first
-        if await self.load_cache(self.exemplars):
-            return
+    # ── BaseEmbeddingIndex abstract impl ───────────────────────────────
+    def _content_hash(self) -> str:
+        return stable_hash(self.exemplars)
+
+    def _texts_to_embed(self) -> List[str]:
+        """Flatten all exemplars into a single list of texts to embed."""
+        all_texts: List[str] = []
+        for intent, texts in self.exemplars.items():
+            all_texts.extend(texts)
+        return all_texts
+
+    def _extra_cache_fields(self) -> Dict[str, Any]:
+        # Store per-intent groupings as JSON so new-format caches don't need
+        # pickle (avoids "Object arrays cannot be loaded" on load).
+        return {
+            "intents": json.dumps(list(self.exemplars.keys())),
+            "intent_embeddings": json.dumps(
+                {k: v.tolist() for k, v in self._intent_embeddings.items()}
+            ),
+            "exemplars": json.dumps(self.exemplars),
+        }
+
+    def _restore_from_cache(self, data: Any) -> bool:
+        """Restore intent-specific state from a loaded npz.
+
+        Note: this is called by the base class with `data` already loaded
+        via `np.load(allow_pickle=False)`. The dual-load (pickle fallback for
+        old-format caches) is handled by `load_or_build` below.
+        """
+        raw_ie = data["intent_embeddings"]
+        if isinstance(raw_ie, str):
+            intent_embeddings_dict = json.loads(raw_ie)
+        else:
+            # Old-format object array
+            extracted = raw_ie.item() if hasattr(raw_ie, "item") else raw_ie
+            if isinstance(extracted, str):
+                intent_embeddings_dict = json.loads(extracted)
+            else:
+                intent_embeddings_dict = dict(extracted)
+
+        expected_texts = sum(len(v) for v in intent_embeddings_dict.values())
+        actual_texts = int(data["embeddings"].shape[0])
+        if actual_texts != expected_texts:
+            logger.warning(
+                "Intent cache exemplar count mismatch: stored=%d, expected=%d. Rebuilding.",
+                actual_texts, expected_texts,
+            )
+            return False
+
+        intents = json.loads(str(data["intents"]))
+        if len(intents) != len(intent_embeddings_dict):
+            logger.warning(
+                "Intent cache intent count mismatch: intents=%d, intent_embeddings=%d. Rebuilding.",
+                len(intents), len(intent_embeddings_dict),
+            )
+            return False
+
+        self._all_intents = intents
+        self._intent_embeddings = {
+            k: np.array(v, dtype=np.float32) for k, v in intent_embeddings_dict.items()
+        }
+        return True
+
+    # ── Intent-specific load with pickle fallback for old caches ──────
+    @classmethod
+    async def load_or_build(
+        cls,
+        exemplars: Dict[str, List[str]],
+        tenant_id: str = "default",
+        max_age_seconds: int = 31536000,
+    ) -> "IntentExemplarIndex":
+        """Load from cache if fresh, else build. Preserves old-format compatibility.
+
+        Old-format caches stored `intent_embeddings` as numpy object arrays,
+        which require `np.load(allow_pickle=True)`. New-format caches store it
+        as a JSON string and can use `allow_pickle=False`.
+        """
+        instance = cls(exemplars, tenant_id=tenant_id)
+        path = instance._find_existing_cache()
+        if path and path.exists():
+            data = await _try_load_intent_cache(path)
+            if data is not None:
+                try:
+                    cached_dim = int(data["embedding_dim"])
+                    actual_dim = (
+                        int(data["embeddings"].shape[1])
+                        if hasattr(data["embeddings"], "shape") else cached_dim
+                    )
+                    if cached_dim != actual_dim:
+                        raise ValueError("Cache dimension mismatch")
+                    if not instance._restore_from_cache(data):
+                        raise ValueError("Subclass restore_from_cache failed")
+                    instance.embedding_dim = actual_dim
+                    instance.embedding_provider = str(
+                        data.get("embedding_provider", "gemini")
+                    )
+                    instance._built_at = float(data["built_at"])
+                    instance._built = True
+                    instance._use_embeddings = True
+                    logger.info(
+                        "IntentExemplarIndex: loaded %d intents from cache (dim=%d, provider=%s)",
+                        len(instance._all_intents), actual_dim, instance.embedding_provider,
+                    )
+                    return instance
+                except Exception as e:
+                    logger.warning("IntentExemplarIndex: cache restore failed, rebuilding: %s", e)
+        # Build path
         try:
-            await self._build_with_embeddings()
+            await instance._build_with_embeddings()
+            instance._save_cache()
         except Exception as e:
             logger.warning("Embedding exemplar build failed (%s). Using Jaccard fallback.", e)
-            self._use_embeddings = False
-            self._build_jaccard_fallback()
-        # Persist to disk cache
-        if self._use_embeddings:
-            self._save_cache(self.exemplars)
-        self._built = True
+            instance._use_embeddings = False
+            instance._build_jaccard_fallback()
+        instance._built = True
+        return instance
+
+    async def build(self) -> None:
+        """Public entry point: build (load or fresh-build) and cache the index."""
+        if self._built:
+            return
+        loaded = await self.load_or_build(self.exemplars, tenant_id=self.tenant_id)
+        # Copy state from the loaded/built instance
+        self._all_intents = loaded._all_intents
+        self._intent_embeddings = loaded._intent_embeddings
+        self.embeddings = loaded.embeddings
+        self.embedding_dim = loaded.embedding_dim
+        self.embedding_provider = loaded.embedding_provider
+        self._built = loaded._built
+        self._use_embeddings = loaded._use_embeddings
 
     async def _build_with_embeddings(self) -> None:
-        all_texts: List[str] = []
-        intent_ranges: List[Tuple[str, int, int]] = []
-
-        for intent, texts in self.exemplars.items():
-            start = len(all_texts)
-            all_texts.extend(texts)
-            intent_ranges.append((intent, start, len(texts)))
-
+        """Embed all exemplar texts and build per-intent groupings."""
+        all_texts = self._texts_to_embed()
         if not all_texts:
-            self._all_intents = []
-            self._all_embeddings = np.zeros((0, 768), dtype=np.float32)
+            self._all_intents = list(self.exemplars.keys())
+            self.embeddings = np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+            self.embedding_dim = EMBEDDING_DIM
             return
 
-        # Batch embed all exemplar texts in as few API calls as possible.
-        from agent.integrations.schema_index import _get_embed_client
-        client = _get_embed_client()
+        from agent.integrations.embedding import get_embed_client
+        client = get_embed_client()
         vectors = await client.embed(all_texts)
 
         self._all_intents = list(self.exemplars.keys())
-        all_vecs: List[List[float]] = []
-        for intent, start, count in intent_ranges:
-            self._intent_embeddings[intent] = np.array(vectors[start:start + count], dtype=np.float32)
-            all_vecs.extend(vectors[start:start + count])
+        self._intent_embeddings = {}
+        idx = 0
+        for intent in self._all_intents:
+            count = len(self.exemplars.get(intent, []))
+            self._intent_embeddings[intent] = np.array(
+                vectors[idx:idx + count], dtype=np.float32
+            )
+            idx += count
 
-        self._all_embeddings = np.array(all_vecs, dtype=np.float32) if all_vecs else np.zeros((0, len(vectors[0]) if vectors else 768))
-        self.embedding_dim = int(self._all_embeddings.shape[1]) if len(self._all_embeddings) > 0 else 768
-        # Record provider and lock the fallback client so query embeddings stay
-        # dimension-aligned with this index (prevents Gemini/Cohere dim mismatch).
+        self.embeddings = np.array(vectors, dtype=np.float32)
+        if len(self.embeddings) > 0:
+            self.embedding_dim = int(self.embeddings.shape[1])
         self.embedding_provider = client.get_active_provider()
-        if hasattr(client, "lock_provider"):
-            client.lock_provider(self.embedding_provider)
-
-    def _cache_path(self, exemplars: Dict[str, List[str]]) -> Path:
-        _INTENT_EXEMPLAR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        schema_hash = _intent_exemplar_hash(exemplars)
-        provider_tag = getattr(self, "embedding_provider", "gemini")
-        model_tag = EMBEDDING_MODEL.replace('/', '_').replace(':', '_')
-        return _INTENT_EXEMPLAR_CACHE_DIR / ('intent_' + schema_hash + '_' + provider_tag + '_' + model_tag + '.npz')
-
-    def _save_cache(self, exemplars: Dict[str, List[str]]) -> None:
-        if self._all_embeddings is None:
-            return
-        path = self._cache_path(exemplars)
-        model_tag = EMBEDDING_MODEL.replace('/', '_').replace(':', '_')
-        provider_tag = getattr(self, "embedding_provider", "gemini")
-        prefix = 'intent_'
-        # Current format: intent_<hash>_<provider>_<model>.npz
-        for f in _INTENT_EXEMPLAR_CACHE_DIR.glob(prefix + '*' + '_' + provider_tag + '_' + model_tag + '.npz'):
-            if f != path and f.is_file():
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-        # Old format with dim suffix: intent_<hash>_<model>_<dim>.npz
-        for f in _INTENT_EXEMPLAR_CACHE_DIR.glob(prefix + '*' + '_' + model_tag + '_' + '[0-9]*.npz'):
-            if f != path and f.is_file():
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-        # Legacy format without model tag: intent_<hash>.npz
-        for f in _INTENT_EXEMPLAR_CACHE_DIR.glob(prefix + '*.npz'):
-            if f == path:
-                continue
-            fname = f.name
-            if model_tag not in fname:
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
-        np.savez_compressed(
-            path,
-            embeddings=self._all_embeddings,
-            intents=json.dumps(self._all_intents),
-            intent_embeddings={k: v.tolist() for k, v in self._intent_embeddings.items()},
-            exemplars=json.dumps(exemplars),
-            built_at=time.time(),
-            embedding_model=EMBEDDING_MODEL,
-            embedding_dim=self.embedding_dim,
-            embedding_provider=provider_tag,
-        )
-        logger.info('IntentExemplarIndex: cached to %s (dim=%d, provider=%s)', path, self.embedding_dim, provider_tag)
-
-    async def load_cache(self, exemplars: Dict[str, List[str]]) -> bool:
-        client = _get_embed_client()
-        active_provider = client.get_active_provider()
-        # Stamp the active provider before computing the cache path so the path
-        # tag matches the provider that will actually be used to (re)build.
-        self.embedding_provider = active_provider
-        path = self._cache_path(exemplars)
-        if not path.exists():
-            return False
-        try:
-            data = np.load(path, allow_pickle=False)
-            cached_dim = int(data['embedding_dim'])
-            if cached_dim != EMBEDDING_DIM:
-                logger.warning('Intent cache dim mismatch: cached=%d, configured=%d. Rebuilding.', cached_dim, EMBEDDING_DIM)
-                return False
-            # Provider validation: only reuse a cache built by the active provider.
-            cached_provider = str(data.get('embedding_provider', 'gemini'))
-            if cached_provider != active_provider:
-                logger.warning('Intent cache provider mismatch: cached=%s, active=%s. Rebuilding.', cached_provider, active_provider)
-                return False
-            if int(data['embeddings'].shape[0]) != len(json.loads(str(data['intents']))):
-                return False
-            self._all_embeddings = data['embeddings']
-            self._all_intents = json.loads(str(data['intents']))
-            intent_embeddings_dict = json.loads(str(data['intent_embeddings']))
-            self._intent_embeddings = {k: np.array(v, dtype=np.float32) for k, v in intent_embeddings_dict.items()}
-            self.embedding_dim = cached_dim
-            self.embedding_provider = cached_provider
-            self._built = True
-            self._use_embeddings = True
-            if hasattr(client, 'lock_provider'):
-                client.lock_provider(cached_provider)
-            logger.info('IntentExemplarIndex: loaded %d intents from cache', len(self._all_intents))
-            return True
-        except Exception as e:
-            logger.debug('IntentExemplarIndex: cache load failed: %s', e)
-            return False
 
     def _build_jaccard_fallback(self) -> None:
         self._all_intents = list(self.exemplars.keys())
         for intent, texts in self.exemplars.items():
             self._intent_token_sets[intent] = [set(t.lower().split()) for t in texts]
 
+    # ── Search ─────────────────────────────────────────────────────────
     async def search(self, query: str, top_k: int = 3) -> List[Tuple[str, float]]:
         """Return top-k (intent, score) pairs for the query."""
         if not self._built:
@@ -305,24 +342,39 @@ class IntentExemplarIndex:
         if not self._all_intents:
             return []
 
-        if self._use_embeddings and self._all_embeddings is not None and len(self._all_embeddings) > 0:
-            return await self._search_embedding(query, top_k)
+        if (
+            self._use_embeddings
+            and self.embeddings is not None
+            and len(self.embeddings) > 0
+        ):
+            try:
+                return await self._search_embedding(query, top_k)
+            except Exception as e:
+                logger.warning(
+                    "Intent embedding search failed (%s); falling back to Jaccard keyword search.",
+                    e,
+                )
+                self._build_jaccard_fallback()
+                return self._search_jaccard(query, top_k)
         return self._search_jaccard(query, top_k)
 
     async def _search_embedding(self, query: str, top_k: int) -> List[Tuple[str, float]]:
-        from agent.integrations.schema_index import _get_embed_client
-        client = _get_embed_client()
-        query_vec = np.array((await client.embed([query]))[0], dtype=np.float32)
+        # Embed the query with the SAME provider used to build this index, so
+        # dimensions align and we avoid hitting the wrong (rate-limited) provider first.
+        query_vec = np.array(
+            (await _embed_texts_with_provider([query], self.embedding_provider))[0],
+            dtype=np.float32,
+        )
 
-        if self._all_embeddings is None or len(self._all_embeddings) == 0:
+        if self.embeddings is None or len(self.embeddings) == 0:
             return []
 
-        norms = np.linalg.norm(self._all_embeddings, axis=1)
+        norms = np.linalg.norm(self.embeddings, axis=1)
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:
             return []
 
-        cosine_scores = np.dot(self._all_embeddings, query_vec) / (norms * query_norm + 1e-8)
+        cosine_scores = np.dot(self.embeddings, query_vec) / (norms * query_norm + 1e-8)
 
         intent_scores: List[Tuple[str, float]] = []
         idx = 0
@@ -338,6 +390,55 @@ class IntentExemplarIndex:
 
         intent_scores.sort(key=lambda x: x[1], reverse=True)
         return intent_scores[:top_k]
+
+    def _search_jaccard(self, query: str, top_k: int) -> List[Tuple[str, float]]:
+        query_tokens = set(query.lower().split())
+        intent_scores: List[Tuple[str, float]] = []
+        for intent in self._all_intents:
+            best = 0.0
+            for token_set in self._intent_token_sets.get(intent, []):
+                intersection = len(query_tokens & token_set)
+                union = len(query_tokens | token_set)
+                jaccard = intersection / union if union > 0 else 0.0
+                best = max(best, jaccard)
+            intent_scores.append((intent, best))
+
+        intent_scores.sort(key=lambda x: x[1], reverse=True)
+        return intent_scores[:top_k]
+
+
+async def _try_load_intent_cache(path: Path) -> Optional[Any]:
+    """Load an intent cache npz, handling old-format object-array fallback.
+
+    New-format caches store `intent_embeddings` as a JSON string and can be
+    loaded with `allow_pickle=False`. Old-format caches stored it as a numpy
+    object array and require `allow_pickle=True`.
+    """
+    # Try non-pickle first (new format)
+    try:
+        data = np.load(path, allow_pickle=False)
+        # Probe to force any deferred object-array error to surface here
+        _ = data["embedding_dim"]
+        _ = data["embeddings"]
+        _ = data["intent_embeddings"]
+        logger.info("IntentExemplarIndex: cache probe ok (allow_pickle=False) for %s", path.name)
+        return data
+    except ValueError as e:
+        if "Object arrays cannot be loaded" in str(e):
+            logger.info(
+                "IntentExemplarIndex: cache has object arrays, retrying with allow_pickle=True for %s",
+                path.name,
+            )
+            try:
+                return np.load(path, allow_pickle=True)
+            except Exception as e2:
+                logger.warning("IntentExemplarIndex: cache load failed (pickle fallback): %s", e2)
+                return None
+        logger.warning("IntentExemplarIndex: cache load failed: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("IntentExemplarIndex: cache load failed: %s", e)
+        return None
 
     def _search_jaccard(self, query: str, top_k: int) -> List[Tuple[str, float]]:
         query_tokens = set(query.lower().split())
@@ -698,14 +799,17 @@ def _get_finance_tables() -> Set[str]:
 
 
 def _detect_finance_query(query: str) -> bool:
-    """Detect if query involves SAP FI/CO finance data (single config-driven source)."""
+    """Detect if query involves SAP FI/CO finance data."""
     q = query.lower()
-    finance_tables = _get_finance_tables()
-    for table in finance_tables:
-        if table.lower() in q:
-            return True
     finance_keywords = get_finance_keywords()
-    return any(kw in q for kw in finance_keywords)
+    if any(kw in q for kw in finance_keywords):
+        return True
+    if is_hana_available():
+        finance_tables = _get_finance_tables()
+        for table in finance_tables:
+            if table.lower() in q:
+                return True
+    return False
 
 
 # =======================================================================

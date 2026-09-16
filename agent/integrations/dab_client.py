@@ -30,13 +30,20 @@ class DABClient:
     """
     MCP client for the DAB Bridge server.
     """
-    def __init__(self, base_url: str, timeout: int = 30, max_retries: int = 3):
+    def __init__(self, base_url: str, timeout: int = 120, max_retries: int = 3, token: Optional[str] = None, role: Optional[str] = None):
         self.base_url = self._sanitize_base_url(base_url.rstrip("/"))
         self.timeout = timeout
         self.max_retries = max_retries
         self.session: Optional[DABSession] = None
         self._http = requests.Session()
         self._sse_response: Optional[requests.Response] = None
+        # Caller identity forwarded to DAB so role-based permissions
+        # (e.g. HRMS_EMPLOYEE create on employee_leave) are enforced.
+        self.token = token
+        # DAB role selected via the X-MS-API-ROLE header. DAB only applies a
+        # custom role when this header is present; without it a valid token
+        # still resolves to the built-in 'authenticated' role (no create).
+        self.role = role
 
     @staticmethod
     def _sanitize_base_url(url: str) -> str:
@@ -76,6 +83,10 @@ class DABClient:
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        if self.token:
+            req_headers["Authorization"] = f"Bearer {self.token}"
+        if self.role:
+            req_headers["X-MS-API-ROLE"] = self.role
         if headers:
             req_headers.update(headers)
 
@@ -247,6 +258,25 @@ class DABClient:
 
         arguments = self._coerce_mcp_arguments(arguments)
         return self._call_tool_mcp(tool_name, arguments)
+
+    def create_record(self, entity_name: str, record: Dict[str, Any]) -> Any:
+        """Create a single record in a DAB entity (tables only)."""
+        if not self.session or not self.session.initialized:
+            self.initialize()
+
+        arguments = self._coerce_mcp_arguments({
+            "entity": entity_name,
+            "data": record,
+        })
+        # Ensure known string-ID fields are emitted as JSON strings so DAB's
+        # schema validation (varchar columns) rejects a numeric value rather
+        # than silently casting. employee_no is the key field for leave writes.
+        rec = arguments.get("data")
+        if isinstance(rec, dict):
+            for field in STRING_ID_FIELDS:
+                if field in rec and rec[field] is not None:
+                    rec[field] = str(rec[field])
+        return self._call_tool_mcp("create_record", arguments)
 
     def _call_tool_mcp(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         """Original MCP tools/call path (unchanged behavior)."""
@@ -447,28 +477,48 @@ class DABTenantClientManager:
         # Fallback URL for emergency or when tenant not in YAML
         self._fallback_url = os.getenv("MCP_SERVER_URL", "http://localhost:5000")
 
-    def get_client(self, tenant_id: str) -> DABClient:
+    def get_client(self, tenant_id: str, token: Optional[str] = None, role: Optional[str] = None) -> DABClient:
         """Get or create DAB client for tenant. Initialization is lazy;
-        first call may block if sync context. For async, use get_client_async."""
+        first call may block if sync context. For async, use get_client_async.
+
+        ``token`` is the caller's bearer JWT and ``role`` is the DAB role
+        (e.g. HRMS_EMPLOYEE), both forwarded to DAB so role-based permissions
+        are enforced on writes. When omitted, the cached client's existing
+        value (if any) is left unchanged.
+        """
         if tenant_id not in self._clients:
             dab_url = resolver.get_tenant_dab_url(tenant_id)
             if not dab_url:
                 dab_url = self._fallback_url
-            client = DABClient(dab_url)
+            client = DABClient(dab_url, token=token, role=role)
             client.initialize()
             self._clients[tenant_id] = client
+        else:
+            if token is not None:
+                # Update the cached client's identity for this request's user so
+                # subsequent tool calls carry the correct Authorization header.
+                self._clients[tenant_id].token = token
+            if role is not None:
+                # Update the cached client's role so subsequent tool calls
+                # carry the correct X-MS-API-ROLE header.
+                self._clients[tenant_id].role = role
         return self._clients[tenant_id]
 
-    async def get_client_async(self, tenant_id: str) -> DABClient:
+    async def get_client_async(self, tenant_id: str, token: Optional[str] = None, role: Optional[str] = None) -> DABClient:
         """PATCH D10: Async-safe client initialization."""
         import asyncio
         if tenant_id not in self._clients:
             dab_url = resolver.get_tenant_dab_url(tenant_id)
             if not dab_url:
                 dab_url = self._fallback_url
-            client = DABClient(dab_url)
+            client = DABClient(dab_url, token=token, role=role)
             await asyncio.to_thread(client.initialize)
             self._clients[tenant_id] = client
+        else:
+            if token is not None:
+                self._clients[tenant_id].token = token
+            if role is not None:
+                self._clients[tenant_id].role = role
         return self._clients[tenant_id]
 
     def _enrich_entities_with_fields(self, client: DABClient, entities: List[Dict]) -> List[Dict]:
@@ -513,7 +563,7 @@ class DABTenantClientManager:
         if cached and not force_refresh and (now - timestamp) < self._cache_ttl_seconds:
             return cached
 
-        client = self.get_client(tenant_id)
+        client = self.get_client(tenant_id, role="HRMS_HR")
         try:
             entities = client.describe_entities()
             # Enrich entities that have no field details
@@ -623,7 +673,20 @@ def format_dab_entities_as_tools(entities: List[Dict[str, Any]]) -> List[Dict[st
                         "groupby": {"type": "array", "items": {"type": "string"}},
                         "orderby": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction for grouped results by aggregated value. Requires groupby."},
                         "distinct": {"type": "boolean", "description": "Remove duplicate values before aggregating. Not valid with field *."},
-                        "having": {"type": "string", "description": "OData filter on aggregated results. Requires groupby."},
+                        "having": {
+                            "type": "object",
+                            "description": "Filter groups by aggregated value. Operators: eq, neq, gt, gte, lt, lte, in. Requires groupby.",
+                            "properties": {
+                                "eq": {"type": "number"},
+                                "neq": {"type": "number"},
+                                "gt": {"type": "number"},
+                                "gte": {"type": "number"},
+                                "lt": {"type": "number"},
+                                "lte": {"type": "number"},
+                                "in": {"type": "array", "items": {"type": "number"}}
+                            },
+                            "additionalProperties": False,
+                        },
                         "filter": {"type": "string"},
                         "first": {"type": "integer"}
                     },
@@ -637,6 +700,24 @@ def format_dab_entities_as_tools(entities: List[Dict[str, Any]]) -> List[Dict[st
                 "name": "describe_entities",
                 "description": "Discover all available entities and their fields.",
                 "parameters": {"type": "object", "properties": {}}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_record",
+                "description": "Create a new record in a DAB entity (tables only). Use for employee actions like applying for leave.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "entity": {"type": "string", "description": "Entity name to create record in (e.g., employee_leave)"},
+                        "data": {
+                            "type": "object",
+                            "description": "Record fields as key-value pairs. For leave: employee_no, leave_code, date_from, date_to, days, status, reason_code."
+                        }
+                    },
+                    "required": ["entity", "data"]
+                }
             }
         }
     ]

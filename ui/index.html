@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>HR Assistant</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!--
+      Token injection: in production, the FastAPI /ui route renders this
+      template with window.__HR_TOKENS__ populated from server-side env vars.
+      In dev, set these manually or via a /ui/config endpoint.
+      Role toggle in the UI swaps between tokens[role].
+    -->
+    <script>
+      window.__HR_TOKENS__ = window.__HR_TOKENS__ || {};
+      window.__HR_ROLE__ = window.__HR_ROLE__ || "employee";
+    </script>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

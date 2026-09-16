@@ -4,19 +4,27 @@
 
 When providing solutions or patches, follow this priority order:
 
-1. **Industry practice first** — Prefer established patterns, widely-adopted libraries, and proven architectures over custom or novel approaches.
-2. **Avoid hardcoding** — Use configuration, environment variables, registries, or dynamic discovery instead of literal strings, magic numbers, or fixed values.
-3. **Be agentic where beneficial** — Favor self-healing, fallback chains, and LLM-driven reasoning over brittle static logic when it improves resilience without sacrificing predictability.
+1. **Industry practice first** ï¿½ Prefer established patterns, widely-adopted libraries, and proven architectures over custom or novel approaches.
+2. **Avoid hardcoding** ï¿½ Use configuration, environment variables, registries, or dynamic discovery instead of literal strings, magic numbers, or fixed values.
+3. **Be agentic where beneficial** ï¿½ Favor self-healing, fallback chains, and LLM-driven reasoning over brittle static logic when it improves resilience without sacrificing predictability.
 
 ## Structure
 
-- `agent/core/` — orchestration, planning, LLM clients
-- `agent/integrations/` — external services (HANA MCP, DAB MCP)
-- `agent/output/` — charting, Excel, binning exports
-- `agent/dab/` — DAB-specific models and validation
-- `agent/summarizer/` — response summarization
-- `agent/auth/` — role-based access
-- `config/` — environment templates and semantic configs
+- `agent/core/` ï¿½ orchestration, planning, LLM clients
+- `agent/integrations/` ï¿½ external services (HANA MCP, SQL MCP)
+- `agent/output/` ï¿½ charting, Excel, binning exports
+- `agent/dab/` ï¿½ DAB-specific models and validation
+- `agent/actions/` ï¿½ unified action framework (step injection for entity operations)
+  - `agent/actions/base_injector.py` ï¿½ shared utilities (field parsing, validation, LLM fallback)
+  - `agent/actions/strategies/` ï¿½ per-entity strategy implementations
+    - `simple_update_strategy.py` ï¿½ self-update entities (employee_general)
+    - `leave_action_strategy.py` ï¿½ leave request creation (header + detail with $ref chaining)
+    - `leave_entitlement_guard.py` ï¿½ ensures entitlement queries hit the right entity
+    - `leave_entitlement_updater.py` ï¿½ entitlement balance adjustments
+    - `leave_strategy.py` ï¿½ dispatcher for leave strategies
+- `agent/summarizer/` ï¿½ response summarization
+- `agent/auth/` ï¿½ role-based access
+- `config/` ï¿½ environment templates and semantic configs
 
 ## Style
 

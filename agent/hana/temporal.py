@@ -1,4 +1,4 @@
-"""agent/hana/temporal.py
+﻿"""agent/hana/temporal.py
 
 Temporal reasoning for HANA financial queries.
 
@@ -12,19 +12,14 @@ import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from agent.integrations.hana_client import hana_manager, normalize_hana_result
+from agent.integrations.hana_client import hana_manager, normalize_hana_result, is_hana_available
+from agent.core.metric_registry import financial_keywords
 
 logger = logging.getLogger("hr_agent")
 
-_FINANCIAL_METRIC_KEYWORDS = frozenset({
-    "gross profit", "gross margin", "net profit", "net margin", "ebitda",
-    "revenue", "sales", "income", "expense", "cost", "budget", "actual",
-    "balance sheet", "cash flow", "cashflow", "profitability", "margin",
-    "profit", "financial", "finance", "fiscal", "accounting", "gl ", "general ledger",
-    "accounts payable", "accounts receivable", "ap ", "ar ", "invoice",
-    "vendor", "customer", "payment", "receipt", "bank", "cash", "asset",
-    "liability", "equity", "depreciation", "amortization", "tax",
-})
+# Financial-domain keyword set is sourced from the shared metric registry
+# (config/metrics.yaml) so finance + HR live in a single source of truth.
+_FINANCIAL_METRIC_KEYWORDS = frozenset(kw.lower() for kw in financial_keywords())
 
 _YEAR_PATTERN = __import__("re").compile(r"\b(20\d{2}|19\d{2})\b")
 
@@ -46,6 +41,10 @@ def extract_year_from_query(user_query: str) -> Optional[int]:
 
 async def get_available_fiscal_years(tenant_id: str = "default") -> List[int]:
     """Return available fiscal years from HANA financial tables, sorted descending."""
+    # If HANA is known to be down, don't attempt connections -- just return no
+    # years so callers fall back to the current/most-recent year.
+    if not is_hana_available():
+        return []
     try:
         client = hana_manager.get_client(tenant_id)
         years = set()
@@ -98,7 +97,6 @@ def resolve_temporal_context(user_query: str, available_years: List[int]) -> Dic
         }
 
     if current_year in available_years:
-        # Current year exists; treat it as potentially incomplete.
         complete_years = [y for y in available_years if y < current_year]
         if complete_years:
             resolved = complete_years[0]

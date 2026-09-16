@@ -1,0 +1,178 @@
+# =============================================================================
+# Entity action configurations
+# Unified registry for entity-specific action patterns.
+# Each entry defines how to handle update/create actions for an entity.
+#
+# Adding a new entity:
+# 1. Add entity config to this file
+# 2. If strategy exists (simple_update, leave_action), no new code needed
+# 3. If new strategy needed, create strategies/new_strategy.py
+# 4. Register in agent/actions/__init__.py _STRATEGY_REGISTRY
+# =============================================================================
+entity_actions:
+  employee_general:
+    # Simple self-update: read by employee_no, then update specific fields.
+    # Primary key is {company_code, employee_no} - we read first to get company_code.
+    strategy: simple_update
+    filter_field: "employee_no"
+    key_fields:
+      - "company_code"
+      - "employee_no"
+    # Fields that employees can update on their own record
+    self_updateable_fields:
+      - "mobile_no"
+      - "personal_email"
+      - "mail_address"
+      - "contact_no"
+      - "emergency_name"
+      - "emergency_contact_no"
+      - "emergency_relation"
+      - "emergency_email"
+      - "emergency_name2"
+      - "emergency_contact_no2"
+      - "emergency_relation2"
+      - "emergency_email2"
+      - "emergency_address"
+      - "emergency_address2"
+      - "nickname"
+      - "personal_title"
+      - "name_ext"
+      - "home_mail_address"
+      - "home_google_geo_lat"
+      - "home_google_geo_lang"
+      - "passport_no"
+      - "passport_expiry"
+      - "visa_no"
+      - "work_permit_no"
+      - "work_permit_expiry"
+      - "work_permit_type"
+      - "work_permit_issued"
+      - "work_permit_application"
+      - "work_permit_issue_authority"
+      - "national_id"
+      - "old_national_id"
+      - "place_of_birth"
+      - "state_of_birth"
+      - "driving_licence"
+      - "place_of_issue"
+      - "country_of_issue"
+      - "place_of_issues"
+      - "country_of_issues"
+      - "oku_no"
+      - "wp_foreign_national_id"
+      - "forward_email"
+      - "claim_on_behalf"
+      - "claim_superior_no"
+      - "google_geo_lang"
+      - "google_geo_lat"
+      - "date_residence"
+      - "marital_status"
+    # Fields NEVER updatable by employees
+    protected_fields:
+      - "company_code"
+      - "employee_no"
+      - "employee_id"
+      - "employee_uuid"
+      - "create_by"
+      - "create_date"
+      - "modify_by"
+      - "modify_date"
+      - "global_no"
+      - "frn_id"
+      - "movement_id"
+      - "employee_name"
+      - "first_name"
+      - "last_name"
+      - "middle_name"
+      - "chinese_name"
+      - "gender"
+      - "birth_date"
+      - "race"
+      - "nationality_code"
+      - "religion"
+      - "employee_status"
+      - "employee_level"
+      - "date_joined"
+      - "date_resigned"
+      - "date_confirm"
+      - "confirmation_status"
+      - "lastday_date"
+      - "tender_date"
+      - "date_increment"
+      - "hod_no"
+      - "superior_no"
+      - "matrix_superior_no"
+      - "branch_code"
+      - "division_code"
+      - "department_code"
+      - "section_code"
+      - "grade_code"
+      - "category_code"
+      - "position_code"
+      - "line_code"
+      - "location_code"
+      - "pay_country"
+      - "pay_grade"
+      - "profit_center"
+      - "cost_center"
+      - "group_code"
+      - "industry_code"
+      - "entity_code"
+      - "bumiputra"
+      - "first_date_joined"
+      - "first_date_confirmed"
+      - "date_resigned_last"
+      - "date_joined_last"
+      - "date_confirm_ext"
+      - "agency"
+      - "invited_date"
+      - "invited_role"
+      - "user_invite"
+      - "azure_ad_username"
+      - "user_id"
+      - "access_code"
+      - "employment_category"
+      - "picture_path"
+      - "creditcard_no"
+      - "tms_app_level"
+      - "POSSIBLE_DATE_RETURN"
+      - "date_leave_country"
+      - "reason_leave_country"
+      - "address_leave_country"
+      - "child_no"
+
+  employee_leave_hd:
+    # Complex create with header-detail pattern
+    strategy: leave_action
+    entity_type: header
+    required_fields:
+      - "employee_no"
+      - "status"
+
+  employee_leave:
+    # Complex create with header_id chaining
+    strategy: leave_action
+    entity_type: detail
+    header_entity: "employee_leave_hd"
+    required_fields:
+      - "hd_id"
+      - "employee_no"
+      - "leave_code"
+      - "date_from"
+      - "date_to"
+      - "days"
+      - "status"
+      - "emergency"
+      - "period_type_from"
+      - "period_type_to"
+
+  employee_leave_entitlement:
+    # Read + update for entitlement adjustments
+    strategy: entitlement_update
+    filter_fields:
+      - "employee_no"
+      - "leave_code"
+      - "year"
+    updatable_fields:
+      - "adjustment"
+      - "remarks"

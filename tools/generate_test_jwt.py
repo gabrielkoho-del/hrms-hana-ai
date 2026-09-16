@@ -69,9 +69,17 @@ def load_tenant_group_mappings(tenant_id: str) -> dict:
 def make_test_token(tenant_id: str, groups: list, user_email: str = "test@local.dev", emp_id: str = None) -> str:
     now = datetime.datetime.now(datetime.timezone.utc)
     
+    # Resolve external IDP groups to internal DAB roles using the same
+    # tenant resolver the agent uses at runtime. DAB's JWT provider reads
+    # the `roles` claim (not `groups`), so we emit both: `groups` for
+    # audit/logging and `roles` for DAB authorization.
+    from agent.auth.tenant_resolver import resolve_tenant_groups
+    internal_roles = resolve_tenant_groups(tenant_id, groups)
+    
     payload = {
         "tenant_id": tenant_id,
         "groups": groups,
+        "roles": internal_roles,
         "email": user_email,
         "sub": f"test-user-{tenant_id}",
         "iat": now,
@@ -166,9 +174,8 @@ def main():
     )
     parser.add_argument(
         "--role",
-        choices=["hr", "manager", "employee"],
         default=None,
-        help="Which test role to generate token for",
+        help="Which test role to generate token for. Accepts abstract roles (hr/manager/employee, auto-mapped via tenant_mappings.yaml) or the raw external group name (e.g. rockfortHR).",
     )
     parser.add_argument(
         "--email",
@@ -205,7 +212,10 @@ def main():
         
         for preset_name, preset in PRESETS.items():
             role = preset["role"]
-            group_name = group_map.get(role, f"Test{role.capitalize()}")
+            # If the user passed an abstract role (hr/manager/employee) and the tenant
+            # has a group mapping, use the mapped group name. Otherwise treat the
+            # argument as the actual external group name (e.g. "rockfortHR").
+            group_name = group_map.get(role, role)
             generate_and_print_token(
                 args.tenant,
                 role,

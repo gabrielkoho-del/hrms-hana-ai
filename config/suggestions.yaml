@@ -18,6 +18,21 @@ action_request:
     - "Contact HR to verify your account status"
     - "Ask your manager for guidance on how to proceed"
 
+leave_action:
+  has_data:
+    - "Which date would you like to take your leave?"
+    - "What type of leave would you like to apply for?"
+  empty_result:
+    - "Verify your employee ID with HR"
+    - "Check if leave entitlement is set up for this year"
+    - "Contact HR to confirm your leave balance"
+
+response_structure:
+  leave_request:
+    stage2_has_data: "This is a leave action request. After presenting the leave balance/entitlement facts, you MUST ask the user for the specific leave date and leave type. Say something like: 'Which date would you like to take your leave?' and 'What type of leave would you like to apply for?' Do NOT say 'What would you like to do next?' or offer generic options like 'Draft a leave application email' or 'Check the status of your previous leave requests'. Do NOT assume Annual Leave (ANL) or today's date — always confirm leave type and date with the user."
+    stage2_empty: "No data found. Explain what you checked (specific entity, filter), then offer 2-3 NUMBERED next steps the user can choose from. Be specific. Example: 'I checked your 2025 leave records and found no matches. You could: (1) check all years, (2) verify your employee ID with HR, (3) ask me to search with a different filter. Which would you like?'"
+    stage3: "This is a leave action request. End by asking the user for the specific leave date and leave type. Say something like: 'Which date would you like to take your leave?' and 'What type of leave would you like to apply for?' Do NOT say 'Ready when you are - just let me know what you'd like to do next.'"
+
 emergency:
   has_data:
     - "Do you need to contact someone immediately?"

@@ -1,0 +1,727 @@
+# config/intents.yaml
+# Single source of truth for intent classification.
+# Loaded by agent/core/intent_classifier.py and agent/core/intent_config.py
+version: 1
+
+# ── Categories ──────────────────────────────────────────────────────────────
+categories:
+  personal_data:
+    label: "Personal Data"
+    description: "Individual employee data lookups (never chart)"
+    chart_eligible: false
+    data_scope: individual
+    urgency_default: routine
+  aggregate_data:
+    label: "Aggregate Data"
+    description: "Aggregate HR metrics, distributions, trends (chart eligible)"
+    chart_eligible: true
+    data_scope: aggregate
+    urgency_default: routine
+  policy_info:
+    label: "Policy Information"
+    description: "Policy questions and how-to guidance (no data)"
+    chart_eligible: false
+    data_scope: none
+    urgency_default: routine
+  action_request:
+    label: "Action Request"
+    description: "User wants to take an action (submit, apply, update)"
+    chart_eligible: false
+    data_scope: individual
+    urgency_default: routine
+  emergency:
+    label: "Emergency"
+    description: "Urgent personal emergencies"
+    chart_eligible: false
+    data_scope: individual
+    urgency_default: distressed
+  grievance:
+    label: "Grievance"
+    description: "Complaints and grievances"
+    chart_eligible: false
+    data_scope: individual
+    urgency_default: urgent
+  greeting:
+    label: "Greeting"
+    description: "Greetings and small talk"
+    chart_eligible: false
+    data_scope: none
+    urgency_default: routine
+  data_discovery:
+    label: "Data Discovery"
+    description: "Questions about what data/systems are available"
+    chart_eligible: false
+    data_scope: none
+    urgency_default: routine
+  workforce_analytics:
+    label: "Workforce Analytics"
+    description: "Workforce productivity metrics (chart eligible)"
+    chart_eligible: true
+    data_scope: aggregate
+    urgency_default: routine
+  dashboard_building:
+    label: "Dashboard Building"
+    description: "Dashboard creation and visualization building"
+    chart_eligible: true
+    data_scope: aggregate
+    urgency_default: routine
+
+# ── Intents ─────────────────────────────────────────────────────────────────
+intents:
+  greeting:
+    category: greeting
+    description: "User says hello or similar"
+    exemplars:
+      - "hello"
+      - "hi there"
+      - "good morning"
+      - "hey"
+      - "hi"
+  smalltalk:
+    category: greeting
+    description: "Casual conversation"
+    exemplars:
+      - "how are you"
+      - "what's up"
+      - "nice to meet you"
+      - "how's it going"
+  leave_request:
+    category: action_request
+    description: "User wants to request leave"
+    exemplars:
+      - "I need to apply for leave"
+      - "Request vacation for next week"
+      - "Can I take sick leave tomorrow"
+      - "Apply for annual leave"
+      - "I'd like to request time off"
+  leave_balance:
+    category: personal_data
+    description: "User wants to check leave balance"
+    exemplars:
+      - "How many leave days do I have"
+      - "Check my leave balance"
+      - "What's my vacation entitlement"
+      - "What's my leave entitlement for this year"
+      - "How much annual leave is left"
+  profile_lookup:
+    category: personal_data
+    description: "User wants to look up a profile"
+    exemplars:
+      - "Who is John Smith"
+      - "Find my profile"
+      - "Show me Jane's details"
+      - "Look up employee 1234"
+  salary_question:
+    category: personal_data
+    description: "User asks about salary or compensation"
+    exemplars:
+      - "What is my salary"
+      - "Show me my compensation"
+      - "How much do I get paid"
+      - "What's my pay scale"
+  org_hierarchy:
+    category: aggregate_data
+    description: "Organization hierarchy or reporting structure"
+    exemplars:
+      - "Show the org chart"
+      - "Who reports to the CEO"
+      - "Organization hierarchy"
+      - "Reporting structure"
+  medical:
+    category: personal_data
+    description: "Medical or health-related query"
+    exemplars:
+      - "I have a medical appointment"
+      - "Need sick leave for doctor visit"
+      - "My health insurance details"
+  emergency:
+    category: emergency
+    description: "Urgent personal emergency"
+    exemplars:
+      - "I have a family emergency"
+      - "Need emergency leave immediately"
+      - "Accident at home, need to leave"
+  complaint:
+    category: grievance
+    description: "User wants to file a complaint"
+    exemplars:
+      - "I want to file a complaint"
+      - "Report harassment"
+      - "I have a grievance about my manager"
+  resignation:
+    category: action_request
+    description: "User wants to resign"
+    exemplars:
+      - "I want to resign"
+      - "Submit my resignation"
+      - "I'm quitting my job"
+      - "How do I resign"
+  benefits_enrollment:
+    category: action_request
+    description: "User wants to enroll in benefits"
+    exemplars:
+      - "Enroll in health insurance"
+      - "Sign up for benefits"
+      - "How do I join the pension plan"
+  profile_update:
+    category: action_request
+    description: "User wants to update their profile"
+    exemplars:
+      - "Update my address"
+      - "Change my phone number"
+      - "Update my emergency contact"
+  training_request:
+    category: action_request
+    description: "User wants to request training"
+    exemplars:
+      - "Request training for Excel"
+      - "Sign up for leadership course"
+      - "I want to learn Python"
+  general_hr:
+    category: policy_info
+    description: "General HR policy or how-to question"
+    exemplars:
+      - "What is the leave policy"
+      - "How do I apply for leave"
+      - "What are the working hours"
+      - "Tell me about the benefits policy"
+  department_count:
+    category: aggregate_data
+    description: "Count of employees by department"
+    exemplars:
+      - "How many employees in each department"
+      - "Headcount by department"
+      - "Employee count per team"
+  gender_distribution:
+    category: aggregate_data
+    description: "Gender distribution analysis"
+    exemplars:
+      - "Gender distribution across the company"
+      - "Male to female ratio by department"
+      - "Show gender breakdown"
+  hiring_trend:
+    category: aggregate_data
+    description: "Hiring trends over time"
+    exemplars:
+      - "Hiring trends for the past year"
+      - "New hires per month"
+      - "Recruitment trend analysis"
+  salary_analysis:
+    category: aggregate_data
+    description: "Salary analysis by group"
+    exemplars:
+      - "Average salary by department"
+      - "Salary distribution across levels"
+      - "Show salary ranges by grade"
+  turnover_analysis:
+    category: aggregate_data
+    description: "Employee turnover analysis"
+    exemplars:
+      - "Turnover rate by department"
+      - "Employee attrition trends"
+      - "Show turnover analysis"
+  age_distribution:
+    category: aggregate_data
+    description: "Age distribution of workforce"
+    exemplars:
+      - "Age distribution of employees"
+      - "Average age by department"
+      - "Workforce age breakdown"
+  performance_distribution:
+    category: aggregate_data
+    description: "Performance rating distribution"
+    exemplars:
+      - "Performance rating distribution"
+      - "Show performance scores by team"
+      - "How many employees got each rating"
+  leave_analysis:
+    category: aggregate_data
+    description: "Leave patterns and analysis"
+    exemplars:
+      - "Leave patterns by department"
+      - "Average leave days taken"
+      - "Leave utilization rate"
+  mc_trend:
+    category: aggregate_data
+    description: "Medical certificate trends"
+    exemplars:
+      - "MC trends over the past year"
+      - "Medical certificate patterns"
+      - "Show MC trends by department"
+  attendance_analysis:
+    category: aggregate_data
+    description: "Attendance analysis"
+    exemplars:
+      - "Attendance rate by department"
+      - "Show attendance patterns"
+      - "Late coming trends"
+  recruitment_funnel:
+    category: aggregate_data
+    description: "Recruitment funnel analysis"
+    exemplars:
+      - "Recruitment funnel conversion rates"
+      - "Show hiring pipeline"
+      - "Applicants to hires ratio"
+  compensation_ratio:
+    category: aggregate_data
+    description: "Compensation ratio analysis"
+    exemplars:
+      - "Comp ratio by department"
+      - "Show compa-ratio analysis"
+      - "How does salary compare to market"
+  headcount_budget:
+    category: aggregate_data
+    description: "Headcount vs budget"
+    exemplars:
+      - "Headcount vs budget"
+      - "Show budgeted vs actual headcount"
+      - "Workforce budget analysis"
+  diversity_hiring:
+    category: aggregate_data
+    description: "Diversity in hiring"
+    exemplars:
+      - "Diversity hiring metrics"
+      - "Show diversity in new hires"
+      - "Gender diversity in recruitment"
+  engagement_scores:
+    category: aggregate_data
+    description: "Employee engagement scores"
+    exemplars:
+      - "Engagement scores by department"
+      - "Show employee engagement results"
+      - "eNPS trends"
+  skills_gap:
+    category: aggregate_data
+    description: "Skills gap analysis"
+    exemplars:
+      - "Skills gap analysis"
+      - "Show competency gaps"
+      - "Missing skills by team"
+  payroll_distribution:
+    category: aggregate_data
+    description: "Payroll distribution"
+    exemplars:
+      - "Payroll distribution by department"
+      - "Show payroll breakdown"
+      - "Total payroll costs"
+  attrition_risk:
+    category: aggregate_data
+    description: "Attrition risk analysis"
+    exemplars:
+      - "Attrition risk by department"
+      - "Show flight risk employees"
+      - "High turnover risk groups"
+  revenue_analysis:
+    category: aggregate_data
+    description: "Revenue analysis"
+    exemplars:
+      - "Revenue by department"
+      - "Show revenue trends"
+      - "Total revenue for the quarter"
+  workforce_productivity:
+    category: workforce_analytics
+    description: "Workforce productivity metrics"
+    exemplars:
+      - "Workforce productivity by department"
+      - "Revenue per employee"
+      - "Show productivity index"
+  revenue_per_employee:
+    category: workforce_analytics
+    description: "Revenue per employee metric"
+    exemplars:
+      - "Revenue per employee by department"
+      - "Show RPE trends"
+      - "Average revenue per head"
+  absenteeism_rate:
+    category: workforce_analytics
+    description: "Absenteeism rate analysis"
+    exemplars:
+      - "Absenteeism rate by department"
+      - "Show absence trends"
+      - "Average sick days per employee"
+  overtime_cost:
+    category: workforce_analytics
+    description: "Overtime cost analysis"
+    exemplars:
+      - "Overtime cost by department"
+      - "Show overtime trends"
+      - "Total overtime spend"
+  finance_gl_analysis:
+    category: aggregate_data
+    description: "General ledger analysis"
+    exemplars:
+      - "GL account analysis"
+      - "General ledger breakdown"
+      - "Show GL account details"
+  finance_cost_analysis:
+    category: aggregate_data
+    description: "Cost center analysis"
+    exemplars:
+      - "Cost center analysis"
+      - "Show personnel costs"
+      - "Cost breakdown by department"
+  finance_currency:
+    category: aggregate_data
+    description: "Currency and exchange rate queries"
+    exemplars:
+      - "Exchange rate for USD"
+      - "Currency conversion rates"
+      - "Show forex rates"
+  finance_budget:
+    category: aggregate_data
+    description: "Budget queries"
+    exemplars:
+      - "Budget vs actual"
+      - "Show budget variance"
+      - "Budget analysis by department"
+  finance_revenue_analysis:
+    category: aggregate_data
+    description: "Financial revenue analysis"
+    exemplars:
+      - "Revenue analysis from finance"
+      - "Show financial revenue"
+      - "Finance revenue by period"
+  finance_profitability:
+    category: aggregate_data
+    description: "Profitability analysis"
+    exemplars:
+      - "Profitability by department"
+      - "Show profit margins"
+      - "Net income analysis"
+  finance_cashflow:
+    category: aggregate_data
+    description: "Cash flow analysis"
+    exemplars:
+      - "Cash flow statement"
+      - "Show cash flow trends"
+      - "Operating cash flow analysis"
+  finance_balance_sheet:
+    category: aggregate_data
+    description: "Balance sheet queries"
+    exemplars:
+      - "Show balance sheet"
+      - "Balance sheet analysis"
+      - "Assets and liabilities breakdown"
+  finance_financial_statement:
+    category: aggregate_data
+    description: "Financial statement queries"
+    exemplars:
+      - "Show financial statements"
+      - "Income statement analysis"
+      - "P&L report"
+  finance_cost_center:
+    category: aggregate_data
+    description: "Cost center queries"
+    exemplars:
+      - "Cost center report"
+      - "Show cost centers"
+      - "Cost center actuals"
+  finance_payroll_analysis:
+    category: aggregate_data
+    description: "Payroll cost analysis"
+    exemplars:
+      - "Payroll cost analysis"
+      - "Show payroll expenses"
+      - "Personnel cost breakdown"
+  finance_accounts_payable:
+    category: aggregate_data
+    description: "Accounts payable queries"
+    exemplars:
+      - "Accounts payable aging"
+      - "Show AP details"
+      - "Vendor payments outstanding"
+  finance_accounts_receivable:
+    category: aggregate_data
+    description: "Accounts receivable queries"
+    exemplars:
+      - "Accounts receivable aging"
+      - "Show AR details"
+      - "Customer payments outstanding"
+  finance_invoice_analysis:
+    category: aggregate_data
+    description: "Invoice analysis"
+    exemplars:
+      - "Invoice analysis"
+      - "Show invoice trends"
+      - "Total invoices this month"
+  finance_vendor_analysis:
+    category: aggregate_data
+    description: "Vendor analysis"
+    exemplars:
+      - "Vendor spending analysis"
+      - "Show vendor breakdown"
+      - "Top vendors by spend"
+  finance_budget_variance:
+    category: aggregate_data
+    description: "Budget variance analysis"
+    exemplars:
+      - "Budget variance analysis"
+      - "Show budget vs actual variance"
+      - "Variance report"
+  finance_forecast:
+    category: aggregate_data
+    description: "Financial forecasting"
+    exemplars:
+      - "Financial forecast for next quarter"
+      - "Project revenue next year"
+      - "Forecast expenses"
+  forecasting_query:
+    category: aggregate_data
+    description: "General forecasting queries"
+    exemplars:
+      - "Predict next month's headcount"
+      - "Forecast hiring needs"
+      - "Trend projection for sales"
+  data_discovery:
+    category: data_discovery
+    description: "User asks what data is available"
+    exemplars:
+      - "What data do you have"
+      - "What tables are available"
+      - "Show me what I can access"
+      - "What schemas exist"
+  create_dashboard:
+    category: dashboard_building
+    description: "User wants to create a dashboard"
+    exemplars:
+      - "Build a dashboard"
+      - "Create a report showing headcount"
+      - "Make a dashboard for sales"
+      - "Visualize this as a dashboard"
+  confirm_save_dashboard:
+    category: dashboard_building
+    description: "User confirms saving a dashboard"
+    exemplars:
+      - "Save the dashboard"
+      - "Yes create it"
+      - "Build the dashboard"
+      - "Confirm"
+
+# ── Keywords ────────────────────────────────────────────────────────────────
+# Single source of truth for all intent-detection keywords.
+# Used for fast-path detection and local fallback when LLM is unavailable.
+keywords:
+  aggregate_indicators:
+    - "count"
+    - "average"
+    - "avg"
+    - "sum"
+    - "total"
+    - "distribution"
+    - "breakdown"
+    - "trend"
+    - "rate"
+    - "analysis"
+    - "by department"
+    - "per department"
+    - "per team"
+    - "gender"
+    - "age"
+    - "salary range"
+    - "turnover"
+    - "attrition"
+    - "hiring"
+    - "headcount"
+    - "budget"
+    - "actual"
+    - "funnel"
+    - "engagement"
+    - "skills"
+    - "compensation"
+    - "compa"
+    - "ratio"
+    - "payroll"
+    - "overtime"
+    - "absenteeism"
+    - "time-to-fill"
+    - "source"
+    - "effectiveness"
+    - "utilization"
+    - "revenue per employee"
+    - "hr-to-employee ratio"
+    - "workforce productivity"
+    - "productivity index"
+    - "absenteeism rate"
+    - "overtime cost"
+    - "revenue"
+    - "revenue analysis"
+    - "total revenue"
+    - "revenue for"
+    - "profit"
+    - "loss"
+    - "net income"
+    - "cash flow"
+    - "cashflow"
+    - "balance sheet"
+    - "financial statement"
+    - "income statement"
+    - "p&l"
+    - "pnl"
+    - "profitability"
+    - "margin"
+    - "cost center"
+    - "cost centre"
+    - "controlling"
+    - "overhead"
+    - "budget variance"
+    - "forecast"
+    - "financial forecast"
+    - "invoice"
+    - "invoices"
+    - "vendor"
+    - "vendors"
+    - "billing"
+    - "accounts payable"
+    - "accounts receivable"
+    - "account payable"
+    - "account receivable"
+    - "fico"
+    - "fi data"
+    - "co data"
+    - "sap fi"
+    - "sap co"
+    - "financial reporting"
+    - "finance report"
+    - "bank details"
+  individual_indicators:
+    - "my "
+    - "i "
+    - "me "
+    - "myself"
+    - "john"
+    - "jane"
+    - "who is"
+    - "profile of"
+    - "salary of"
+    - "leave of"
+    - "balance of"
+    - "entitlement of"
+  finance:
+    - "gl account"
+    - "general ledger"
+    - "bank details"
+    - "chart of accounts"
+    - "accounting"
+    - "account payable"
+    - "account receivable"
+    - "accounts payable"
+    - "accounts receivable"
+    - "revenue"
+    - "sales revenue"
+    - "total revenue"
+    - "revenue analysis"
+    - "profit"
+    - "loss"
+    - "net income"
+    - "operating income"
+    - "ebitda"
+    - "profitability"
+    - "margin"
+    - "gross margin"
+    - "net margin"
+    - "cash flow"
+    - "cashflow"
+    - "operating cash flow"
+    - "free cash flow"
+    - "balance sheet"
+    - "assets"
+    - "liabilities"
+    - "equity"
+    - "financial statement"
+    - "income statement"
+    - "p&l"
+    - "pnl"
+    - "cost center"
+    - "cost centre"
+    - "controlling"
+    - "overhead"
+    - "budget"
+    - "budget variance"
+    - "forecast"
+    - "financial forecast"
+    - "salary cost"
+    - "compensation cost"
+    - "benefits cost"
+    - "personnel cost"
+    - "labor cost"
+    - "fte cost"
+    - "headcount cost"
+    - "exchange rate"
+    - "currency conversion"
+    - "forex"
+    - "vendor"
+    - "vendors"
+    - "invoice"
+    - "invoices"
+    - "billing"
+    - "fico"
+    - "fi data"
+    - "co data"
+    - "sap fi"
+    - "sap co"
+    - "financial reporting"
+    - "finance report"
+  forecast:
+    - "forecast"
+    - "predict"
+    - "project"
+    - "trend"
+    - "next quarter"
+    - "next month"
+    - "next year"
+  export:
+    - "export"
+    - "download"
+    - "save"
+    - "excel"
+    - "spreadsheet"
+    - "xlsx"
+    - "workbook"
+    - "file"
+    - "send me"
+    - "give me the data"
+  export_offer:
+    - "export to excel"
+    - "download"
+    - "save as spreadsheet"
+    - "send me the file"
+    - "get a file"
+  multi_option_offer:
+    - "or would you prefer"
+    - "or"
+    - "instead"
+    - "which would you like"
+    - "choose one"
+    - "would you like me to"
+    - "shall i"
+    - "do you want"
+  affirmative:
+    - "yes"
+    - "yeah"
+    - "yep"
+    - "yup"
+    - "sure"
+    - "ok"
+    - "okay"
+    - "please"
+    - "pls"
+    - "go ahead"
+    - "do it"
+    - "send it"
+    - "export it"
+    - "download it"
+    - "yes please"
+    - "yes pls"
+    - "yess"
+    - "yas"
+    - "affirmative"
+    - "confirm"
+
+# ── Regex Patterns ──────────────────────────────────────────────────────────
+# Stored as raw strings; compiled at load time in intent_classifier.py
+full_info_patterns:
+  - "\\b(pull|get|show|give|fetch|send)\\s+(me\\s+)?(my\\s+)?(full|complete|all|entire)\\s+(the\\s+)?(info|information|details|record|records|data|profile)\\b"
+  - "\\b(my\\s+full|my\\s+complete|all\\s+my|full\\s+profile|complete\\s+profile)\\b"
+  - "\\b(full|complete|all)\\s+the\\s+(record|records|info|information|details)\\b"
+  - "\\b(full|complete|all)\\s+(record|records|info|information|details)\\b"
+  - "\\b(everything|raw\\s+data|all\\s+fields|all\\s+columns)\\s+(on\\s+file|in\\s+your\\s+system|you\\s+have)\\b"

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 
@@ -15,7 +15,6 @@ import time
 import glob
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any, Literal
-from datetime import datetime
 import numpy as np
 
 from fastapi import FastAPI, HTTPException, Request, Depends
@@ -39,7 +38,8 @@ from agent.config import (
     LARGE_RESULT_THRESHOLD, AGENT_BASE_URL, DEFAULT_MAX_ROWS, MAX_SQL_LENGTH,
     UNLIMITED_ROWS, RATE_LIMIT_PER_MINUTE, RATE_LIMIT_WINDOW_SECONDS,
     CONTEXT_WINDOW_SIZE, MAX_TOKENS, SCHEMA_REGISTRY_TTL_SECONDS,
-    SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS
+    SCHEMA_REGISTRY_REFRESH_INTERVAL_SECONDS,
+    JWT_SECRET, JWT_ALGORITHM, JWT_AUDIENCE, AUTH_MODE,
 )
 from agent.output.chart_generator import generate_chart, extract_chartable_data, CHART_OUTPUT_DIR
 from agent.core.tool_planner import build_tool_plan
@@ -64,8 +64,12 @@ from agent.integrations.hana_client import hana_manager
 # Schema registry service (replaces ad-hoc file I/O in agentic_executor)
 from agent.integrations.schema_registry import schema_registry_service
 
+# Dynamic dashboard routes
+from agent.integrations.dynamic_dashboard import dashboard_router
+
 # Reflexive agent executor
 from agent.core.agentic_executor import run_reflexive_agent
+from agent.core.progress import set_progress_emitter, reset_progress_emitter
 
 # ==============================
 # LOGGING SETUP
@@ -101,7 +105,7 @@ dab_manager = DABTenantClientManager()
 # TOOL DISCOVERY
 # ==============================
 async def discover_tools():
-    """Discover tools and schema from DAB server and HANA MCP server."""
+    """Discover tools and schema from SQL MCP server and HANA MCP server."""
     global CACHED_TOOLS, CACHED_TOOLS_PROMPT, CACHED_SCHEMA
     tool_lines = []
     tenant_id = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
@@ -147,19 +151,20 @@ async def discover_tools():
                 try:
                     data = np.load(cache_path, allow_pickle=False)
                     cached_dim = int(data["embedding_dim"])
-                    if cached_dim == EMBEDDING_DIM:
+                    actual_dim = int(data["embeddings"].shape[1]) if hasattr(data["embeddings"], "shape") else cached_dim
+                    if cached_dim == actual_dim:
                         schema_index_ready = True
                         logger.info(
-                            "Schema index cache exists at %s (dim=%d, age=%.0fs) â€” skipping warmup build.",
+                            "Schema index cache exists at %s (dim=%d, age=%.0fs) Ã¢â‚¬â€ skipping warmup build.",
                             cache_path.name,
                             cached_dim,
                             time.time() - float(data["built_at"]),
                         )
                     else:
                         logger.warning(
-                            "Schema cache dim mismatch (cached=%d, config=%d) â€” rebuilding.",
+                            "Schema cache dim mismatch (stored=%d, actual=%d) Ã¢â‚¬â€ rebuilding.",
                             cached_dim,
-                            EMBEDDING_DIM,
+                            actual_dim,
                         )
                 except Exception as e:
                     logger.warning("Schema cache pre-check failed, will warm: %s", e)
@@ -184,7 +189,7 @@ async def discover_tools():
     except Exception as e:
         logger.error("DAB tool discovery failed: %s", e)
 
-    # HANA schema discovery â€” run once at startup (independent of DAB)
+    # HANA schema discovery Ã¢â‚¬â€ run once at startup (independent of DAB)
     try:
         from agent.integrations.hana_client import hana_manager
         hana_schemas = await _discover_hana_schemas(tenant_id)
@@ -275,7 +280,7 @@ async def _discover_hana_schemas(tenant_id: str) -> Dict[str, List[str]]:
         existing = schema_registry_service._registries.get(tenant_id.upper())
         if existing and existing != schemas:
             logger.info(
-                "HANA schema registry mismatch for tenant=%s (cached=%d schemas, live=%d schemas) â€” invalidating cache",
+                "HANA schema registry mismatch for tenant=%s (cached=%d schemas, live=%d schemas) Ã¢â‚¬â€ invalidating cache",
                 tenant_id, len(existing), len(schemas),
             )
             schema_registry_service.invalidate_tenant(tenant_id)
@@ -321,120 +326,10 @@ def _normalize_name_list(result: Any) -> List[str]:
 
 # ==============================
 # PERMISSION ENFORCEMENT
+# (relocated to agent/auth/tool_guards.py to break the import cycle
+#  agent.core.agentic_executor -> agent.main -> agent.core.agentic_executor)
 # ==============================
-def enforce_tool_args(tool: str, args: dict, auth_context: AuthContext) -> tuple[dict, Optional[str]]:
-    """
-    Enforce permission-based restrictions on tool arguments before execution.
-    Returns (args, error_message). If error_message is set, the tool call is blocked.
-    """
-    if not auth_context or not auth_context.authenticated:
-        return args, None
-
-    # HR/Admin can use any tool without restriction
-    if "read:all_employees" in auth_context.permissions:
-        return args, None
-
-    # --- aggregate_records: block for read:self if it reveals org-wide data ---
-    if tool == "aggregate_records":
-        groupby = args.get("groupby", [])
-        # If grouping by department without self-filter, it's org-wide
-        if groupby and "read:self" in auth_context.permissions:
-            # Allow if it has a self-filter
-            filt = args.get("filter", "")
-            if not _has_self_filter(filt, auth_context):
-                return args, (
-                    "Access denied: Aggregations across all employees are not available for your role. "
-                    "You can only access your own profile information."
-                )
-
-    # --- read_records: validate filter permissions ---
-    if tool == "read_records":
-        from agent.tool_planner import validate_dab_filter_permissions
-        filt = args.get("filter", "")
-        is_valid, error = validate_dab_filter_permissions(filt, args.get("entity", ""), auth_context)
-        if not is_valid:
-            return args, error
-
-    return args, None
-
-
-def _has_self_filter(filter_str: str, auth_context: AuthContext) -> bool:
-    """Check if an OData filter contains a self-referential constraint.
-    
-    Checks both EMAIL (case-insensitive) and emp_id/EMPLOYEE_NO value.
-    Multi-tenant aware: supports both employee table (emp_id) and V_EMP view (EMPLOYEE_NO).
-    """
-    if not filter_str or not auth_context:
-        return False
-    filt_lower = filter_str.lower()
-    if auth_context.email and auth_context.email.lower() in filt_lower:
-        return True
-    if auth_context.emp_id:
-        emp_id_str = str(auth_context.emp_id)
-        if emp_id_str in filter_str:
-            return True
-    return False
-
-
-def filter_tool_results(tool: str, result_text: str, auth_context: AuthContext) -> str:
-    """
-    Post-execution result filtering based on user permissions.
-    Defense in depth: even if filter validation missed something, filter results.
-    """
-    if not auth_context or not auth_context.authenticated:
-        return result_text
-
-    # HR/Admin sees everything
-    if "read:all_employees" in auth_context.permissions:
-        return result_text
-
-    # Only filter read_records results for now
-    if tool != "read_records":
-        return result_text
-
-    try:
-        data = json.loads(result_text) if isinstance(result_text, str) else result_text
-    except Exception:
-        return result_text
-
-    if not isinstance(data, dict):
-        return result_text
-
-    # DAB read_records returns {"entity": "...", "result": [...], "message": "..."}
-    # Fall back to REST-style {"value": [...]} or {"items": [...]}
-    items = data.get("items", data.get("value", data.get("result", [])))
-    if not isinstance(items, list):
-        return result_text
-
-    if not items:
-        return result_text
-
-    # For read:self users, strict filtering to own data only
-    if "read:self" in auth_context.permissions:
-        filtered_items = []
-        for item in items:
-            if not isinstance(item, dict):
-                filtered_items.append(item)
-                continue
-            is_self = False
-            if auth_context.email:
-                item_email = str(item.get("EMAIL", item.get("email", ""))).lower()
-                if item_email == auth_context.email.lower():
-                    is_self = True
-            if auth_context.emp_id:
-                # V_EMP view uses EMPLOYEE_NO; employee table uses emp_id
-                item_emp_id = str(item.get("EMPLOYEE_NO", item.get("emp_id", "")))
-                if item_emp_id == str(auth_context.emp_id):
-                    is_self = True
-            if is_self:
-                filtered_items.append(item)
-
-        data["items"] = filtered_items
-        data["value"] = filtered_items
-        # Preserve pagination info if present
-        return json.dumps(data, default=str)
-
-    return result_text
+from agent.auth.tool_guards import enforce_tool_args, filter_tool_results  # noqa: F401 (re-exported)
 
 
 async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
@@ -486,7 +381,7 @@ async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
 
                 if live_schemas != cached_schemas:
                     logger.info(
-                        "SchemaRegistry: startup mismatch detected for tenant=%s (cached=%d schemas, live=%d schemas) â€” refreshing",
+                        "SchemaRegistry: startup mismatch detected for tenant=%s (cached=%d schemas, live=%d schemas) Ã¢â‚¬â€ refreshing",
                         tenant_id, len(cached_schemas), len(live_schemas),
                     )
                     schema_registry_service.invalidate_tenant(tenant_id)
@@ -501,7 +396,7 @@ async def _validate_and_refresh_startup_registries(hana_manager: Any) -> None:
                 logger.warning("SchemaRegistry: startup validation failed for tenant=%s: %s", tenant_id, e)
         elif is_stale:
             logger.info(
-                "SchemaRegistry: startup stale cache detected for tenant=%s (age=%ds > TTL=%ds) â€” will reload on next access",
+                "SchemaRegistry: startup stale cache detected for tenant=%s (age=%ds > TTL=%ds) Ã¢â‚¬â€ will reload on next access",
                 tenant_id,
                 int(schema_registry_service._now() - schema_registry_service._last_loaded_at.get(tenant_key, 0)),
                 schema_registry_service.ttl_seconds,
@@ -581,6 +476,57 @@ app = FastAPI(title="HR AI Agent API", lifespan=lifespan)
 
 app.mount("/exports", StaticFiles(directory=EXPORT_DIR), name="exports")
 
+# Mount the custom HR chat UI (built React app in ui/dist).
+# Served same-origin so the relative /v1 fetch works without CORS.
+# NOTE: /ui/config route is registered BEFORE this mount so it isn't
+# shadowed by StaticFiles.
+@app.get("/ui/config")
+async def ui_config():
+    """Return JWT tokens for the custom HR chat UI.
+
+    In dev (AUTH_MODE=test), tokens are generated on-the-fly from JWT_SECRET
+    with appropriate roles. In production, HR_EMPLOYEE_TOKEN and HR_ADMIN_TOKEN
+    env vars should be set to pre-issued JWTs.
+    """
+    import jwt as pyjwt
+    import datetime
+
+    employee_token = os.getenv("HR_EMPLOYEE_TOKEN", "")
+    admin_token = os.getenv("HR_ADMIN_TOKEN", "")
+
+    if not employee_token or not admin_token:
+        # Dev mode: generate tokens on-the-fly from JWT_SECRET
+        now = datetime.datetime.now(datetime.timezone.utc)
+        common = {
+            "iss": "local-dev-issuer",
+            "aud": JWT_AUDIENCE,
+            "iat": int(now.timestamp()),
+            "exp": int((now + datetime.timedelta(hours=8)).timestamp()),
+        }
+        if not employee_token:
+            employee_token = pyjwt.encode(
+                {**common, "tenant_id": "RDEMOROCKFORT", "groups": ["rockfortEmployee"],
+                 "roles": ["HRMS_EMPLOYEE"], "email": "dev.employee@rymnet.com",
+                 "sub": "dev-employee", "emp_id": "A0002"},
+                JWT_SECRET, algorithm=JWT_ALGORITHM,
+            )
+        if not admin_token:
+            admin_token = pyjwt.encode(
+                {**common, "tenant_id": "RDEMOROCKFORT", "groups": ["rockfortHR"],
+                 "roles": ["HRMS_HR"], "email": "dev.admin@rymnet.com",
+                 "sub": "dev-admin", "emp_id": "A0001"},
+                JWT_SECRET, algorithm=JWT_ALGORITHM,
+            )
+
+    return {"employee_token": employee_token, "admin_token": admin_token}
+
+_ui_dist = Path(__file__).parent.parent / "ui" / "dist"
+if _ui_dist.exists():
+    app.mount("/ui", StaticFiles(directory=str(_ui_dist), html=True), name="ui")
+    logger.info("Mounted custom UI at /ui from %s", _ui_dist)
+else:
+    logger.warning("ui/dist not found -- custom UI not mounted. Run 'npm run build' in ui/")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -651,7 +597,7 @@ class ChatCompletionStreamResponse(BaseModel):
 # ==============================
 # CORE AGENT LOGIC (REFLEXIVE ONLY)
 # ==============================
-async def run_agent(messages: List[Dict], auth_context: AuthContext) -> str:
+async def run_agent(messages: List[Dict], auth_context: AuthContext, is_custom_ui: bool = False) -> str:
     user_query = messages[-1]["content"] if messages else ""
 
     conversation_history = ""
@@ -665,58 +611,223 @@ async def run_agent(messages: List[Dict], auth_context: AuthContext) -> str:
             turns.append(f"{role_label}: {m['content'][:200]}")
         conversation_history = "\n".join(turns)
 
-    logger.info("Using reflexive agent mode")
+    logger.info("Using reflexive agent mode (custom_ui=%s)", is_custom_ui)
     return await run_reflexive_agent(
         user_query=user_query,
         conversation_history=conversation_history,
         auth_context=auth_context,
         cached_tools=CACHED_TOOLS,
         cached_schema=CACHED_SCHEMA,
+        is_custom_ui=is_custom_ui,
     )
 
 
 # ==============================
 # RESPONSE FORMATTING
 # ==============================
+def _model_name(request: ChatCompletionRequest) -> str:
+    return "hr-agent" if request.model == "ai-agent" else request.model
+
+
+def _role_chunk(completion_id: str, created: int, model: str) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def _progress_chunk(completion_id: str, created: int, model: str, progress: Dict) -> str:
+    """OpenAI-shaped chunk carrying a side-channel progress event.
+
+    The delta is empty so LibreChat (and any strict OpenAI consumer) sees a
+    no-op chunk; the hr_progress field is read by the custom HR chat UI.
+    """
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "hr_progress": progress,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def _chart_chunk(completion_id: str, created: int, model: str, payload: Dict) -> str:
+    """OpenAI-shaped chunk carrying a structured Chart.js payload.
+
+    Emitted only for clients that send X-HR-Client: custom-ui. The delta is
+    empty so LibreChat (which ignores unknown fields) is unaffected.
+    """
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "hr_chart": payload,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def _content_chunk(completion_id: str, created: int, model: str, text: str) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+def _stop_chunk(completion_id: str, created: int, model: str) -> str:
+    chunk = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    return f"data: {json.dumps(chunk)}\n\n"
+
+
+async def _answer_chunks(completion_id: str, created: int, model: str, answer: str):
+    """Yield the role chunk, content chunks (10 chars each), and stop chunk.
+
+    Refactored out of format_streaming_response so the streaming endpoint can
+    interleave progress chunks before the answer.
+    """
+    yield _role_chunk(completion_id, created, model)
+
+    chunk_size = 10
+    for i in range(0, len(answer), chunk_size):
+        yield _content_chunk(completion_id, created, model, answer[i:i + chunk_size])
+        await asyncio.sleep(0.01)
+
+    yield _stop_chunk(completion_id, created, model)
+    yield "data: [DONE]\n\n"
+
+
+async def _content_chunks(completion_id: str, created: int, model: str, answer: str):
+    """Yield content chunks (10 chars each) and stop chunk, WITHOUT the role chunk.
+
+    Used by stream_agent_response which emits the role chunk first, then
+    progress events, then content.
+    """
+    chunk_size = 10
+    for i in range(0, len(answer), chunk_size):
+        yield _content_chunk(completion_id, created, model, answer[i:i + chunk_size])
+        await asyncio.sleep(0.01)
+
+    yield _stop_chunk(completion_id, created, model)
+    yield "data: [DONE]\n\n"
+
+
 def format_streaming_response(request: ChatCompletionRequest, answer: str):
+    """Legacy streaming response -- kept for backward compatibility.
+
+    New streaming path uses stream_agent_response() which interleaves progress
+    events. This function is retained for any direct callers/tests.
+    """
     async def generate():
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         created = int(time.time())
-        model = "hr-agent" if request.model == "ai-agent" else request.model
-
-        first_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
-        }
-        yield f"data: {json.dumps(first_chunk)}\n\n"
-
-        chunk_size = 10
-        for i in range(0, len(answer), chunk_size):
-            chunk = answer[i:i+chunk_size]
-            data_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
-            }
-            yield f"data: {json.dumps(data_chunk)}\n\n"
-            await asyncio.sleep(0.01)
-
-        stop_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": model,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }
-        yield f"data: {json.dumps(stop_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
+        model = _model_name(request)
+        async for chunk in _answer_chunks(completion_id, created, model, answer):
+            yield chunk
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+async def stream_agent_response(request: ChatCompletionRequest, messages: List[Dict], auth_context: AuthContext, is_custom_ui: bool = False):
+    """Stream the agent pipeline with interleaved progress and chart events.
+
+    Runs run_agent() as a background task while draining a queue. Progress
+    events (via the ContextVar emitter in agent.core.progress) are yielded as
+    OpenAI-shaped chunks with an hr_progress side-channel field. Structured
+    chart payloads (hr_chart) are yielded as separate chunks when the client
+    sends X-HR-Client: custom-ui. When the task completes, the answer is
+    chunked and streamed.
+
+    The is_custom_ui flag (derived from the X-HR-Client header by the caller)
+    determines whether markdown chart artifacts are suppressed in favor of the
+    hr_chart side-channel.
+    """
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    created = int(time.time())
+    model = _model_name(request)
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _on_progress(stage: str, label: str, detail: str = None):
+        queue.put_nowait({"type": "progress", "stage": stage, "label": label, "detail": detail})
+
+    def _on_chart(payload: Dict):
+        queue.put_nowait({"type": "chart", "payload": payload})
+
+    async def _run():
+        token = set_progress_emitter(_on_progress, _on_chart if is_custom_ui else None)
+        try:
+            return await run_agent(messages, auth_context, is_custom_ui=is_custom_ui)
+        finally:
+            reset_progress_emitter(token)
+
+    task = asyncio.create_task(_run())
+
+    async def generate():
+        try:
+            # Emit the role chunk first (establishes assistant identity).
+            yield _role_chunk(completion_id, created, model)
+
+            # Drain progress/chart events while the agent runs.
+            while not task.done():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    # No progress for 15s -- emit a keepalive comment so
+                    # proxies don't close the connection.
+                    yield ": keepalive\n\n"
+                    continue
+                if event["type"] == "chart":
+                    yield _chart_chunk(completion_id, created, model, event["payload"])
+                else:
+                    yield _progress_chunk(completion_id, created, model, event)
+
+            # Drain any events queued after the task finished.
+            while not queue.empty():
+                event = queue.get_nowait()
+                if event["type"] == "chart":
+                    yield _chart_chunk(completion_id, created, model, event["payload"])
+                else:
+                    yield _progress_chunk(completion_id, created, model, event)
+
+            # Stream the answer content (role chunk already sent above).
+            answer = task.result()
+            async for chunk in _content_chunks(completion_id, created, model, answer):
+                yield chunk
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Agent execution failed during stream")
+            # Can't change HTTP status after headers sent; emit a friendly
+            # error as content so the client sees something.
+            error_msg = "I encountered an error while processing your request. Please try again."
+            async for chunk in _answer_chunks(completion_id, created, model, error_msg):
+                yield chunk
+        finally:
+            if not task.done():
+                task.cancel()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 def format_json_response(request: ChatCompletionRequest, answer: str):
@@ -735,27 +846,33 @@ def format_json_response(request: ChatCompletionRequest, answer: str):
 # ==============================
 # FASTAPI ENDPOINTS
 # ==============================
+app.include_router(dashboard_router)
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
-    auth_context: AuthContext = Depends(verify_token)
+    auth_context: AuthContext = Depends(verify_token),
+    http_request: Request = None,
 ):
     logger.info("Request from user: %s (tenant=%s, roles=%s)",
                 auth_context.email, auth_context.tenant_id, auth_context.internal_roles)
 
     messages = [{"role": m.role, "content": m.content} for m in request.messages]
 
-    messages = [{"role": m.role, "content": m.content} for m in request.messages]
-
-    try:
-        answer = await run_agent(messages, auth_context)
-    except Exception as e:
-        logger.exception("Agent execution failed")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Client hint: custom HR chat UI sends X-HR-Client: custom-ui.
+    # This gates the hr_chart side-channel and suppresses markdown chart
+    # injection for that client (LibreChat and all other clients are unaffected).
+    client_hint = http_request.headers.get("X-HR-Client", "") if http_request else ""
+    is_custom_ui = client_hint == "custom-ui"
 
     if request.stream:
-        return format_streaming_response(request, answer)
+        return await stream_agent_response(request, messages, auth_context, is_custom_ui)
     else:
+        try:
+            answer = await run_agent(messages, auth_context, is_custom_ui=is_custom_ui)
+        except Exception as e:
+            logger.exception("Agent execution failed")
+            raise HTTPException(status_code=500, detail=str(e))
         return format_json_response(request, answer)
 
 
@@ -773,7 +890,7 @@ async def list_models(auth_context: AuthContext = Depends(verify_token)):
 
 @app.get("/charts/{filename}")
 async def serve_chart(filename: str):
-    """Serve generated chart PNGs. No auth required â€” filenames are random timestamps (unguessable)."""
+    """Serve generated chart PNGs. No auth required Ã¢â‚¬â€ filenames are random timestamps (unguessable)."""
     filepath = os.path.join(CHART_OUTPUT_DIR, filename)
     logger.info("CHART_SERVE: filename=%s exists=%s", filename, os.path.exists(filepath))
     if os.path.exists(filepath):
@@ -817,10 +934,11 @@ async def health(auth_context: AuthContext = Depends(verify_token)):
     }
 
 
+
 if __name__ == "__main__":
     import uvicorn
     discovery_tenant = os.getenv("DAB_DISCOVERY_TENANT", "RDEMOROCKFORT")
-    print("Starting HR AI Agent API on http://localhost:8000")
+    print(f"Starting HR AI Agent API on http://localhost:{os.getenv('AGENT_PORT', '8001')}")
     print(f"DAB discovery tenant: {discovery_tenant}")
     print("DAB routing: per-tenant via tenant_mappings.yaml")
     print(f"RAG collection: {CHROMA_COLLECTION_NAME} at {CHROMA_DB_PATH}")
@@ -828,5 +946,5 @@ if __name__ == "__main__":
     print(f"Chart output: {CHART_OUTPUT_DIR}")
     print(f"Auth mode: {os.getenv('AUTH_MODE', 'test')}")
     print(f"Agent mode: {AGENT_MODE}")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("AGENT_PORT", "8001")))
 

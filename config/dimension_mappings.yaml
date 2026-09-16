@@ -1,0 +1,46 @@
+# Dimension keyword -> preferred column mapping.
+# Used to correct LLM tool calls that pick semantically wrong dimension fields
+# (e.g., COST_CENTER when the user asked for department).
+dimension_map:
+  department: ["department_code", "department"]
+  branch: ["branch_code", "branch"]
+  company: ["company_code", "company"]
+  division: ["division_code"]
+  section: ["section_code"]
+  position: ["position_description", "position_code"]
+  gender: ["gender"]
+  nationality: ["nationality_code", "nationality"]
+  marital: ["marital_status"]
+  status: ["employee_status"]
+  location: ["location_code", "location"]
+  grade: ["grade_code", "grade"]
+  category: ["category_code", "category"]
+  "pay country": ["pay_country"]
+  country: ["pay_country"]
+  "cost center": ["cost_center", "cost_center_code"]
+  "profit center": ["profit_center"]
+  superior: ["superior_no", "superior"]
+  manager: ["superior_no", "superior"]
+  level: ["employee_level", "level_code", "level"]
+  confirmation: ["confirmation_status", "confirmation"]
+  resigned: ["date_resigned", "resigned"]
+  joined: ["date_joined", "joined"]
+  hire: ["date_joined", "hire_date", "hire"]
+  tenure: ["date_joined", "tenure"]
+
+# All known dimension fields that can be corrected when the user asked for a
+# different dimension. This prevents replacing non-dimension fields like
+# EMPLOYEE_NAME or SALARY.
+all_dimension_fields:
+  - "cost_center"
+  - "cost_center_code"
+  - "profit_center"
+  - "grade_code"
+  - "category_code"
+  - "pay_country"
+  - "superior_no"
+  - "employee_level"
+  - "level_code"
+  - "confirmation_status"
+  - "date_resigned"
+  - "date_joined"

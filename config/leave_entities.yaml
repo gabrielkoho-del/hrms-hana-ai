@@ -1,0 +1,51 @@
+# Leave entity configuration
+# Contains leave-specific config ONLY.
+# Entity action configs have been moved to entity_actions.yaml
+
+# Preference order for leave-entitlement entity lookups.
+# Prefer richer summary views first; fall back to raw entitlement tables.
+entitlement_entity_preference:
+  - "v_employee_leave_summary"
+  - "v_employee_leave_entitlement"
+  - "employee_leave_entitlement"
+
+# All known leave-entitlement entities.
+entitlement_entities:
+  - "employee_leave_entitlement"
+  - "v_employee_leave_entitlement"
+  - "v_employee_leave_summary"
+
+# Keywords that indicate a leave-entitlement query.
+entitlement_keywords:
+  - "leave entitlement"
+  - "leave balance"
+  - "leave_entitlement"
+  - "leave_balance"
+  - "how much leave"
+  - "how many leave"
+  - "my leave"
+  - "annual leave"
+  - "vacation entitlement"
+  - "vacation balance"
+
+# Keywords that indicate an action request (apply, request, book, etc.).
+action_keywords:
+  - "apply"
+  - "request"
+  - "book"
+  - "submit"
+  - "take"
+  - "reschedule"
+  - "cancel"
+  - "modify"
+  - "change"
+  - "adjust"
+  - "update"
+  - "edit"
+  - "correct"
+  - "add"
+  - "increase"
+  - "decrease"
+  - "reduce"
+  - "deduct"
+  - "carry"

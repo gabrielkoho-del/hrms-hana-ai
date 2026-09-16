@@ -9,7 +9,7 @@ from agent.core.utils import schema_cache
 logger = logging.getLogger("hr_agent")
 
 
-def build_tone_aware_guidance(tone_context: Dict) -> str:
+def build_tone_aware_guidance(tone_context: Dict, leave_codes: Optional[List[str]] = None) -> str:
     if not tone_context:
         return ""
     guidance_parts = []
@@ -27,10 +27,28 @@ def build_tone_aware_guidance(tone_context: Dict) -> str:
         )
 
     if category == "action_request":
+        leave_codes_str = ", ".join(leave_codes) if leave_codes else "ANL, MCL, MAT, UPL, CL, HPL, RPL, EXM, WFH"
         guidance_parts.append(
             "- ACTION REQUEST: The user wants to DO something. "
-            "Fetch all prerequisites they need to complete the action: "
-            "eligibility, current status, required approvals, contact info. "
+            f"CRITICAL: For ANY leave-related action request (apply leave, book leave, request leave, take leave, etc.), you MUST follow this exact flow:\n"
+            "  STEP 1: Fetch the employee's leave entitlement/balance using read_records on employee_leave_entitlement or v_employee_leave_summary.\n"
+            "  STEP 2: In your response text, state the available balance in plain language (e.g. 'You have 22 days of Annual Leave available'). Format whole numbers without decimals (e.g. '22 days', not '22.0 days').\n"
+            "  STEP 3: Immediately ask the user for the specific leave date and leave type. Say something like: 'Which date would you like to take your leave?' and 'What type of leave would you like to apply for?'\n"
+            "  STEP 4: Do NOT say 'What would you like to do next?' or offer generic options like 'Draft a leave application email' or 'Check the status of your previous leave requests'. These are NOT appropriate for an action request.\n"
+            "  STEP 5: Do NOT assume Annual Leave (ANL) or today's date — always confirm leave type and date with the user.\n"
+            f"  STEP 6: Only call create_record on employee_leave when ALL of these required fields are confirmed:\n"
+            f"           - leave_code (valid values from codesetup: {leave_codes_str})\n"
+            "           - date_from (start date, YYYY-MM-DD)\n"
+            "           - date_to (end date, YYYY-MM-DD)\n"
+            "           - days (number of leave days, supports decimals for half-day)\n"
+            "           - period_type_from (1=Full day, 2=Half day AM, 3=Half day PM)\n"
+            "           - period_type_to (1=Full day, 2=Half day AM, 3=Half day PM)\n"
+            "           - emergency (Y=Yes, N=No)\n"
+            "           - status (P=Pending)\n"
+            "           - employee_no (from authenticated user)\n"
+            "           - hd_id (from the employee_leave_hd record created first)\n"
+            "  STEP 7: Create employee_leave_hd first, then use its returned id as hd_id for employee_leave.\n"
+            "For other actions: use the appropriate create_record or update_record tool. "
             "Include an 'action_context' describing the specific action."
         )
 
@@ -98,8 +116,8 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
             "description": (
                 "Query records from a DAB entity using OData filters. "
                 "Use eq, ne, gt, ge, lt, le, and, or, not. "
-                "Text filters do NOT support contains/LIKE — use exact eq or fetch broader. "
-                "For dates, use pre-computed fields like hire_year/hire_month — NEVER year(hire_date). "
+                "Text filters do NOT support contains/LIKE -- use exact eq or fetch broader. "
+                "For dates, use pre-computed fields like hire_year/hire_month -- NEVER year(hire_date). "
                 f"Available entities: {entity_examples}..."
             ),
             "parameters": {
@@ -163,17 +181,27 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
                         "description": "Fields to group by"
                     },
                     "orderby": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Sort fields"
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "description": "Sort direction for grouped results by aggregated value (requires groupby; default desc)"
                     },
                     "filter": {
                         "type": "string",
                         "description": "OData filter expression"
                     },
                     "having": {
-                        "type": "string",
-                        "description": "Having clause for group filtering"
+                        "type": "object",
+                        "description": "Filter groups by aggregated value. Operators: eq, neq, gt, gte, lt, lte, in. Requires groupby.",
+                        "properties": {
+                            "eq": {"type": "number"},
+                            "neq": {"type": "number"},
+                            "gt": {"type": "number"},
+                            "gte": {"type": "number"},
+                            "lt": {"type": "number"},
+                            "lte": {"type": "number"},
+                            "in": {"type": "array", "items": {"type": "number"}}
+                        },
+                        "additionalProperties": False,
                     },
                     "first": {
                         "type": "string",
@@ -198,7 +226,62 @@ def build_dab_tool_schemas(cached_schema: Dict) -> List[Dict]:
         }
     }
 
-    return [read_records_schema, aggregate_records_schema, describe_entities_schema]
+    create_record_schema = {
+        "type": "function",
+        "function": {
+            "name": "create_record",
+            "description": (
+                "Create a new record in a DAB entity (tables only). "
+                "Use for employee actions like applying for leave. "
+                "The employee_no field will be auto-populated from the user's identity for self-service actions."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Entity name to create record in (e.g., employee_leave)"
+                    },
+                    "data": {
+                        "type": "object",
+                        "description": "Record fields as key-value pairs. For leave: employee_no, leave_code, date_from, date_to, days, status, reason_code."
+                    }
+                },
+                "required": ["entity", "data"]
+            }
+        }
+    }
+
+    update_record_schema = {
+        "type": "function",
+        "function": {
+            "name": "update_record",
+            "description": (
+                "Update an existing record in a DAB entity by key. "
+                "Use for modifying existing records like updating a leave request."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity": {
+                        "type": "string",
+                        "description": "Entity name to update record in"
+                    },
+                    "keys": {
+                        "type": "object",
+                        "description": "Primary key fields to identify the record to update (e.g., {\"id\": 42})."
+                    },
+                    "fields": {
+                        "type": "object",
+                        "description": "Field names and new values to update."
+                    }
+                },
+                "required": ["entity", "keys", "fields"]
+            }
+        }
+    }
+
+    return [read_records_schema, aggregate_records_schema, describe_entities_schema, create_record_schema, update_record_schema]
 
 
 def build_hana_tool_schemas(tenant_id: Optional[str] = None) -> List[Dict]:
@@ -226,6 +309,7 @@ def build_tool_calling_system_prompt(
     tone_guidance: str = "",
     hana_schema_registry: Optional[Dict[str, List[str]]] = None,
     hana_semantic_block: Optional[str] = None,
+    field_semantics_block: Optional[str] = None,
 ) -> str:
     parts = [
         "You are an HR AI agent with DAB data access. Use the available tools to fetch data. "
@@ -252,12 +336,16 @@ def build_tool_calling_system_prompt(
         parts.extend(["", user_context])
     if tone_guidance:
         parts.extend(["", tone_guidance])
+    if field_semantics_block:
+        parts.extend(["", field_semantics_block, ""])
 
     parts.extend([
         "",
         "ENTITY NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The entity 'Employees' is NOT the same as 'employees' or 'employee'. Use the exact PascalCase names shown in the schema above. NEVER lowercase, NEVER snake_case, NEVER pluralize or singularize. If the schema says 'Employees', you MUST use 'Employees' exactly.",
         "",
-        "FIELD NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The field 'EMAIL' is NOT the same as 'email'. The field 'FULL_NAME' is NOT 'full_name'. Use the EXACT field names shown in the schema above — copy them character-for-character into select, filter, orderby, groupby, and field parameters. This applies to ALL OData arguments: select='EMAIL,FULL_NAME', filter='EMAIL eq value', orderby=['BASIC_SALARY desc'], groupby=['DEPARTMENT']. NEVER guess or normalize field names.",
+        "FIELD NAMES ARE CASE-SENSITIVE AND MUST MATCH EXACTLY. The field 'EMAIL' is NOT the same as 'email'. The field 'FULL_NAME' is NOT 'full_name'. Use the EXACT field names shown in the schema above -- copy them character-for-character into select, filter, orderby, groupby, and field parameters. This applies to ALL OData arguments: select='EMAIL,FULL_NAME', filter='EMAIL eq value', orderby=['BASIC_SALARY desc'], groupby=['DEPARTMENT']. NEVER guess or normalize field names.",
+        "",
+        "LEAVE ENTITLEMENT QUERIES: When the user asks about leave entitlement, leave balance, how much leave they have, or similar personal leave questions, query the 'v_employee_leave_summary' or 'v_employee_leave_entitlement' entity. Filter by EMPLOYEE_NO (or employee_no) and year. Do NOT query V_EMP or Employees for leave entitlement data -- those entities do not contain leave balances.",
         "",
         "CHART RULES:",
         "- Pre-binned data (age_group, salary_range) -> bar. Raw numeric distribution -> hist.",
@@ -293,7 +381,7 @@ def build_tool_calling_system_prompt(
 def _build_hana_prompt_block(
     hana_schema_registry: Optional[Dict[str, List[str]]] = None,
 ) -> List[str]:
-    schema_lines = ["SAP HANA ACCESS — available schemas/tables:"]
+    schema_lines = ["SAP HANA ACCESS -- available schemas/tables:"]
     registry = hana_schema_registry or {}
     if registry:
         schema_lines.append("- Authorized schemas and tables (discovered at startup):")
@@ -322,15 +410,159 @@ def _build_hana_prompt_block(
         "- HANA queries do NOT support OData filters; write plain SQL.",
         "- HANA IDENTIFIER RULES: Unquoted identifiers are case-insensitive and stored as UPPERCASE. Quoted identifiers are case-sensitive. Always use UPPERCASE unquoted identifiers in SQL, e.g., SELECT COUNT(*) FROM BKPF or SELECT COUNT(*) FROM DBADMIN.BKPF. NEVER use lowercase quoted identifiers like 'bkpf' or 'DBADMIN.bkpf'; HANA will reject them.",
         "- FINANCIAL QUERY TIME HANDLING: When user asks for annual financial metrics (gross profit, margin, revenue, EBITDA, net profit, expenses, financial ratios) WITHOUT specifying a year, default to the MOST RECENT COMPLETE FISCAL YEAR, not the current year. Current year data is often incomplete. If current year is 2026, prefer 2025 for annual financials unless user explicitly requests 2026. For quarterly/monthly data, use the most recent complete period. Always mention the year/period used in your answer so the user knows what data was queried.",
-        "- HANA DATE/MONTH EXTRACTION: Never use SUBSTRING(BUDAT, 5, 2) to extract month from dates. BUDAT is a DATE field; in HANA SQL it is NOT a plain 'YYYYMMDD' string. Use MONTH(BUDAT) for numeric month (1-12), or TO_VARCHAR(BUDAT, 'MM') for zero-padded month strings ('01'-'12'). For posting period, use POPER directly — it already contains the fiscal period (1-12 or 1-16).",
+        "- HANA DATE/MONTH EXTRACTION: Never use SUBSTRING(BUDAT, 5, 2) to extract month from dates. BUDAT is a DATE field; in HANA SQL it is NOT a plain 'YYYYMMDD' string. Use MONTH(BUDAT) for numeric month (1-12), or TO_VARCHAR(BUDAT, 'MM') for zero-padded month strings ('01'-'12'). For posting period, use POPER directly -- it already contains the fiscal period (1-12 or 1-16).",
         "- MULTI-METRIC FINANCIAL REPORTS: When the user asks for multiple metrics (e.g., Revenue, Gross Profit, EBITDA, Net Profit) in one report, return a WIDE format result with one row per time period and one column per metric. Example: SELECT POPER, SUM(CASE WHEN RACCT IN ('800000','805000') THEN -HSL ELSE 0 END) AS REVENUE, SUM(CASE WHEN RACCT BETWEEN '420000' AND '480000' THEN HSL ELSE 0 END) AS GROSS_PROFIT, ... FROM DBADMIN.FAGLFLEXA WHERE GJAHR = '2025' GROUP BY POPER ORDER BY POPER. Do NOT return separate result sets for each metric. Include a METRIC column only if stacking vertically; prefer horizontal wide format for charts.",
     ])
     return schema_lines
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SCHEMA FORMATTING — selective enrichment + token pruning
-# ═════════════════════════════════════════════════════════════════════════════
+def format_field_semantics_for_prompt(
+    cached_schema: Dict,
+    dimension_map: Optional[Dict[str, List[str]]] = None,
+    leave_codes: Optional[List[Tuple[str, str]]] = None,
+) -> str:
+    """Build a concise field-semantics reference for the system prompt.
+
+    Maps common HR query concepts to the correct DAB fields so the LLM
+    picks the right column upfront instead of guessing.
+    """
+    if not cached_schema:
+        return ""
+
+    # Build a lookup of all field names across all entities (lowercase -> exact)
+    all_fields: Dict[str, str] = {}
+    for entity_data in cached_schema.values():
+        if not isinstance(entity_data, dict):
+            continue
+        for f in entity_data.get("fields", entity_data.get("columns", [])):
+            if isinstance(f, dict):
+                name = f.get("name", "")
+                if name:
+                    all_fields[name.lower()] = name
+
+    lines = ["FIELD SEMANTICS (use these exact field names):"]
+
+    # Helper to add a semantic line only if the field exists in the schema
+    def _add(concept: str, field_name: str, warning: str = "") -> None:
+        if field_name.lower() in all_fields:
+            exact = all_fields[field_name.lower()]
+            if warning:
+                lines.append(f"- {concept}: use {exact}. {warning}")
+            else:
+                lines.append(f"- {concept}: use {exact}")
+
+    # Track which fields have been added to avoid duplicates
+    _added_fields: set = set()
+
+    def _add_unique(concept: str, field_name: str, warning: str = "") -> None:
+        if field_name.lower() in all_fields and field_name.lower() not in _added_fields:
+            _added_fields.add(field_name.lower())
+            _add(concept, field_name, warning)
+
+    # Employment / status
+    _add("active/inactive/current/former employees", "EMPLOYEE_STATUS",
+         "NOT confirmation_status (that is probation status PROB/CONF). "
+         "Filter values are codes, not English words: ACTV=active, RESG=resigned, ABSC=absent, JOIN=joined, TERM=terminated, DECE=deceased.")
+    _add("probation/confirmation status", "CONFIRMATION_STATUS",
+         "This is probation status, not employment status. "
+         "Filter values are codes, not English words: CONF=confirmed, PROB=probation.")
+    _add("gender", "GENDER",
+         "Filter values are codes, not English words: M=Male, F=Female, S=unknown.")
+    _add("marital status", "MARITAL_STATUS",
+         "Filter values are codes, not English words: S=Single, M=Married, D=Divorced, C=Widowed, 0=Unknown.")
+
+    # Identifiers
+    _add("employee number / ID", "EMPLOYEE_NO")
+    _add("employee name", "EMPLOYEE_NAME")
+    _add("email address", "EMAIL")
+
+    # Demographics
+    _add("birth date / age", "BIRTH_DATE")
+    _add("gender", "GENDER")
+    _add("marital status", "MARITAL_STATUS")
+    _add("nationality", "NATIONALITY_CODE")
+    _add("race/ethnicity", "RACE")
+
+    # Dates
+    _add("join date / tenure", "DATE_JOINED")
+    _add("original join date", "FIRST_DATE_JOINED")
+    _add("resignation date", "DATE_RESIGNED")
+    _add("confirmation date (end of probation)", "DATE_CONFIRM")
+
+    # Organization — derived from _DIMENSION_MAP so the LLM knows the
+    # correct column for each dimension keyword.
+    if dimension_map:
+        _dim_labels = {
+            "department": "department",
+            "branch": "branch",
+            "company": "company",
+            "division": "division",
+            "section": "section",
+            "position": "position",
+            "gender": "gender",
+            "nationality": "nationality",
+            "marital": "marital status",
+            "status": "employee status",
+            "location": "location",
+        }
+        for kw, cols in dimension_map.items():
+            preferred = cols[0]
+            label = _dim_labels.get(kw, kw)
+            _add_unique(label, preferred)
+
+    # Employment details
+    _add("employment category", "EMPLOYMENT_CATEGORY")
+    _add("employee level / grade", "EMPLOYEE_LEVEL")
+    _add("grade / pay grade", "GRADE_CODE")
+    _add("category code", "CATEGORY_CODE")
+    _add("cost center", "COST_CENTER")
+    _add("profit center", "PROFIT_CENTER")
+
+    # Leave enum values — these are codes, not English words.
+    lines.append("")
+    lines.append("LEAVE ENUM VALUES (use these exact codes in filters and create_record):")
+    lines.append(
+        "- employee_leave.status / employee_leave_hd.status: P=Pending, A=Approved, R=Rejected, C=Cancelled. "
+        "Do NOT use English words like 'Pending' or 'Approved' in OData filters."
+    )
+    lines.append(
+        "- employee_leave.emergency: Y=Yes, N=No."
+    )
+    lines.append(
+        "- employee_leave.period_type_from / period_type_to: 1=Full day, 2=Half day (AM), 3=Half day (PM)."
+    )
+    if leave_codes:
+        # Dynamically fetched from codesetup WHERE type='Leave Type'
+        code_str = ", ".join(f"{code}={desc}" for code, desc in leave_codes[:50])
+        lines.append(
+            f"- employee_leave.leave_code / employee_leave_entitlement.leave_code: {code_str}. "
+            "Query codesetup WHERE type='Leave Type' for the canonical list."
+        )
+    else:
+        lines.append(
+            "- employee_leave.leave_code / employee_leave_entitlement.leave_code: "
+            "ANL=Annual, MCL=Medical Clinic, MAT=Maternity, COM=Compassionate, UPL=Unpaid, WFH=Work from home, "
+            "HPL=Hospitalization, RPL=Replacement, CL=Childcare, EXM=Examination, CAL=Call, HOS=Hospitalization, "
+            "ABS=Absent, ADL=Accidental, CPL=Compassionate, PAT=Paternity, SPL=Sick, PTL=Paternity, "
+            "MRL=Medical, NS=No Show, CC=Career Change, ECC=Emergency, UICL=Unpaid, UML=Unpaid, SPTL=Sick, "
+            "RPH=Rest Day, ANL-CT=Annual Carry-over, ANL_ESS=Annual ESS, UPL1/2=Unpaid half-day, "
+            "UPL1=Unpaid, UPL_No_ESS=Unpaid, Leave_No_ESS=Leave, RLC1/RLC2=Related, PILF/PILH=Related, "
+            "SMTL=Sick, CCL1/CCL2=Childcare, HL=Hospitalization. "
+            "Query codesetup WHERE type='Leave Type' for the canonical list."
+        )
+    lines.append(
+        "- employee_leave_entitlement.entitlement_type: Y=Yearly/annual entitlement."
+    )
+
+    if len(lines) <= 1:
+        return ""
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# SCHEMA FORMATTING -- selective enrichment + token pruning
+# =============================================================================
 
 # Config knobs for schema formatting
 MAX_ENTITIES = 20

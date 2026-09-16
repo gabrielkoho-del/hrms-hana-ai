@@ -24,6 +24,7 @@ import time
 import base64
 import logging
 import math
+import re
 from typing import List, Dict, Optional, Literal, Tuple, Any
 
 import pandas as pd
@@ -33,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from agent.data.response import extract_items
+from agent.dab.code_resolver import CodeResolver
 
 logger = logging.getLogger("hr_agent")
 
@@ -82,7 +84,111 @@ NON_NUMERIC_COLUMN_PATTERNS = {
     "text", "comment", "address", "city", "country", "state", "region",
     "status", "type", "category", "department", "job_title", "location",
     "email", "phone", "url", "link", "image", "file", "path",
+    # HR-specific categorical columns
+    "training", "reason", "leave_type", "grade", "level", "band",
+    "division", "section", "position", "cost_center", "profit_center",
+    "nationality", "marital_status", "gender", "employment_status",
+    "reason_for_leaving", "generation", "age_group", "tenure_group",
+    "experience_range", "performance_rating", "job_level",
 }
+
+# Map chart data columns to codesetup types for code→description translation.
+# Used by translate_codes_for_display() to pick the correct description
+# when a code value maps to multiple types (e.g. "M" → Gender/Marital Status).
+COLUMN_TYPE_MAP = {
+    "gender": "Gender",
+    "marital_status": "Marital Status",
+    "employee_status": "Employee Status",
+    "confirmation_status": "Confirmation Status",
+    "status": "Leave Status",
+    "leave_code": "Leave Type",
+    "emergency": "Emergency",
+    "period_type_from": "Period Type",
+    "period_type_to": "Period Type",
+    "entitlement_type": "Entitlement Type",
+}
+
+
+def translate_codes_for_display(data: List[Dict], tenant_id: str) -> List[Dict]:
+    """Replace raw enum codes in chart data with human-readable descriptions.
+
+    Uses the cached CodeResolver reverse index so chart axes/tables show
+    descriptions like 'Annual Leave' instead of 'ANL'.
+    """
+    if not data or not tenant_id:
+        return data
+
+    resolver = CodeResolver(tenant_id)
+    reverse_index = resolver.get_cached_reverse_index()
+    if not reverse_index:
+        return data
+
+    translated: List[Dict] = []
+    for row in data:
+        new_row: Dict[str, Any] = {}
+        for col, val in row.items():
+            if val is None:
+                new_row[col] = val
+                continue
+            str_val = str(val).strip()
+            if not str_val or str_val.lower() in {"nan", "none", "null"}:
+                new_row[col] = val
+                continue
+            # Skip values that look like IDs, dates, emails, salaries
+            if _is_likely_id_or_numeric(str_val):
+                new_row[col] = val
+                continue
+            # Look up code in reverse index
+            matches = reverse_index.get(str_val, [])
+            if not matches:
+                new_row[col] = val
+                continue
+            # Pick description matching the column's expected type
+            expected_type = COLUMN_TYPE_MAP.get(col.lower())
+            description = None
+            if expected_type:
+                for code_type, desc in matches:
+                    if code_type.lower() == expected_type.lower():
+                        description = desc
+                        break
+            if description is None:
+                description = matches[0][1]
+            new_row[col] = description if description else val
+        translated.append(new_row)
+    return translated
+
+
+def _is_likely_id_or_numeric(value: str) -> bool:
+    """Heuristic: skip values that look like IDs, dates, or currency."""
+    if not value or not isinstance(value, str):
+        return True
+    s = value.strip()
+    if not s:
+        return True
+    if s.isdigit() and len(s) >= 10:
+        return True
+    if re.match(r'^-?\d+$', s):
+        return len(s) <= 6
+    date_patterns = [
+        r'^\d{4}-\d{2}-\d{2}$',
+        r'^\d{2}/\d{2}/\d{4}$',
+        r'^\d{2}-\d{2}-\d{4}$',
+        r'^\d{4}-\d{2}-\d{2}T',
+        r'^\d{4}-\d{2}',
+    ]
+    for pat in date_patterns:
+        if re.match(pat, s):
+            return True
+    if "@" in s and re.match(r'^[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}$', s):
+        return True
+    try:
+        float(s.replace('$', '').replace(',', '').replace(' ', ''))
+        return True
+    except ValueError:
+        pass
+    if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', s):
+        return True
+    return False
 
 
 def _is_string_like_dtype(dtype: Any) -> bool:
@@ -320,6 +426,37 @@ def _pick_columns(data: List[Dict], chart_type: str) -> tuple[Optional[str], Opt
         if any(kw in c1.lower() for kw in ("count", "total", "sum", "avg", "average", "revenue", "expense", "profit", "amount", "value")):
             return c0, c1, True, None
 
+    # Scatter-specific: if chart_type is scatter and we have 2+ numeric columns,
+    # use the first two numeric columns as x and y
+    if chart_type == "scatter" and len(all_cols) >= 2:
+        numeric_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df[c])]
+        if len(numeric_cols) >= 2:
+            return numeric_cols[0], numeric_cols[1], False, None
+        elif len(numeric_cols) == 1:
+            # Try coercing the other column
+            for c in all_cols:
+                if c not in numeric_cols:
+                    try:
+                        coerced = pd.to_numeric(df[c], errors="coerce")
+                        if coerced.notna().any():
+                            df[c] = coerced
+                            return c, numeric_cols[0], False, None
+                    except (ValueError, TypeError):
+                        continue
+
+    # Heatmap-specific: if chart_type is heatmap, look for pivot-friendly structure
+    if chart_type == "heatmap" and len(all_cols) >= 3:
+        # Expect: row_dim, col_dim, value_col
+        numeric_cols = [
+            c for c in all_cols
+            if pd.api.types.is_numeric_dtype(df[c]) and df[c].notna().any()
+        ]
+        if len(numeric_cols) >= 1:
+            value_col = numeric_cols[0]
+            dim_cols = [c for c in all_cols if c != value_col]
+            if len(dim_cols) >= 2:
+                return dim_cols[0], dim_cols[1], False, None
+
     # Standard classification
     numeric_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df[c])]
     categorical_cols = [c for c in all_cols if c not in numeric_cols]
@@ -390,14 +527,18 @@ def _generate_alt_text(data: List[Dict], chart_type: str, x_col: Optional[str], 
     # PATCH 2026-06-24: humanize snake_case column names for accessibility
     x = (x_col or "category").replace("_", " ").strip()
     y = (y_col or "value").replace("_", " ").strip()
-    if chart_type == "pie":
+    if chart_type == "pie" or chart_type == "doughnut":
         return f"{t}: Pie chart showing proportional breakdown across {n} {x} categories."
     elif chart_type in ("bar", "barh"):
         return f"{t}: Bar chart comparing {n} {x} categories by {y}."
-    elif chart_type == "line":
+    elif chart_type == "line" or chart_type == "area":
         return f"{t}: Line chart showing {y} trend across {n} {x} data points."
     elif chart_type == "hist":
         return f"{t}: Histogram showing distribution of {x} across {n} records."
+    elif chart_type == "scatter":
+        return f"{t}: Scatter plot showing relationship between {x} and {y} across {n} records."
+    elif chart_type == "heatmap":
+        return f"{t}: Heatmap showing patterns across {n} {x} categories."
     else:
         return f"{t}: Chart displaying {n} data points."
 
@@ -495,7 +636,7 @@ def generate_mermaid_chart(
 
     lines = ["```mermaid"]
 
-    if chart_type == "pie":
+    if chart_type == "pie" or chart_type == "doughnut":
         if series_col:
             # Multi-series pie: aggregate to top-level categories
             df = df.groupby(x_col)[y_col].sum().reset_index()
@@ -531,7 +672,7 @@ def generate_mermaid_chart(
             x_axis_col = "__x_label__"
         else:
             x_axis_col = x_col
-        categories = [f'"{_escape_mermaid(str(v))}"' for v in df[x_axis_col].tolist()]
+        categories = [f'"{_escape_mermaid(str(v)) if str(v).strip() else "N/A"}"' for v in df[x_axis_col].tolist()]
         lines.append(f'    x-axis [{", ".join(categories)}]')
         if y_col and y_col in df.columns:
             values = [str(v) for v in df[y_col].tolist()]
@@ -929,6 +1070,156 @@ def generate_matplotlib_chart(
             )
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=0, ha="center")
 
+        elif chart_type == "scatter":
+            # Scatter requires two numeric columns
+            if y_col and y_col in df.columns and x_col in df.columns:
+                # Coerce both columns to numeric
+                _coerce_numeric(df, [x_col, y_col])
+                clean_df = df[[x_col, y_col]].dropna()
+                if clean_df.empty:
+                    logger.warning("CHART_DEBUG_MATPLOTLIB: scatter has no valid numeric data")
+                    plt.close(fig)
+                    return ""
+                ax.scatter(clean_df[x_col], clean_df[y_col], alpha=0.6, s=50, color=COLORBLIND_PALETTE[0])
+                ax.set_xlabel(x_col.replace("_", " ").title())
+                ax.set_ylabel(y_label if y_label else _humanize_y_label(y_col))
+                # Add trend line for scatter
+                if len(clean_df) >= 2:
+                    try:
+                        coeffs = np.polyfit(clean_df[x_col], clean_df[y_col], 1)
+                        trend_x = np.linspace(clean_df[x_col].min(), clean_df[x_col].max(), 100)
+                        trend_y = coeffs[0] * trend_x + coeffs[1]
+                        ax.plot(trend_x, trend_y, linestyle="--", color=COLORBLIND_PALETTE[-1], linewidth=1.5, label="Trend")
+                        ax.legend()
+                    except Exception as e:
+                        logger.debug("CHART_DEBUG_MATPLOTLIB: scatter trend line failed: %s", e)
+            else:
+                logger.warning("CHART_DEBUG_MATPLOTLIB: scatter requires both x_column and y_column")
+                plt.close(fig)
+                return ""
+
+        elif chart_type == "heatmap":
+            # Heatmap requires pivot-style data: x_col as index, y_col as columns, values as heat
+            if y_col and y_col in df.columns and x_col in df.columns:
+                # Detect value column: first numeric column that is not x_col or y_col
+                numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and c not in (x_col, y_col)]
+                if len(numeric_cols) >= 1:
+                    value_col = numeric_cols[0]
+                    # Use original data for pivot to avoid corrupted dtypes from upstream coercion
+                    pivot_df = pd.DataFrame(data).pivot_table(index=x_col, columns=y_col, values=value_col, aggfunc="mean")
+                    if pivot_df.empty:
+                        logger.warning("CHART_DEBUG_MATPLOTLIB: heatmap pivot is empty")
+                        plt.close(fig)
+                        return ""
+                    im = ax.imshow(pivot_df.values, cmap="YlOrRd", aspect="auto")
+                    ax.set_xticks(np.arange(len(pivot_df.columns)))
+                    ax.set_yticks(np.arange(len(pivot_df.index)))
+                    ax.set_xticklabels(pivot_df.columns, rotation=45, ha="right")
+                    ax.set_yticklabels(pivot_df.index)
+                    ax.set_xlabel(y_col.replace("_", " ").title())
+                    ax.set_ylabel(x_col.replace("_", " ").title())
+                    plt.colorbar(im, ax=ax, label=value_col.replace("_", " ").title())
+                else:
+                    # Fallback: correlation heatmap of all numeric columns
+                    numeric_df = df.select_dtypes(include=[np.number])
+                    if numeric_df.shape[1] >= 2:
+                        corr = numeric_df.corr()
+                        im = ax.imshow(corr.values, cmap="coolwarm", aspect="auto", vmin=-1, vmax=1)
+                        ax.set_xticks(np.arange(len(corr.columns)))
+                        ax.set_yticks(np.arange(len(corr.index)))
+                        ax.set_xticklabels(corr.columns, rotation=45, ha="right")
+                        ax.set_yticklabels(corr.index)
+                        plt.colorbar(im, ax=ax, label="Correlation")
+                    else:
+                        logger.warning("CHART_DEBUG_MATPLOTLIB: heatmap needs at least 2 numeric columns")
+                        plt.close(fig)
+                        return ""
+            else:
+                logger.warning("CHART_DEBUG_MATPLOTLIB: heatmap requires x_column and y_column")
+                plt.close(fig)
+                return ""
+
+        elif chart_type == "area":
+            if series_col:
+                df = _composite_x_labels(df, x_col, series_col)
+                plot_df = df.sort_values(by=x_col)
+                plot_df.plot(x="__x_label__", y=y_col, kind="area", ax=ax, alpha=0.4, color=COLORBLIND_PALETTE[0])
+                ax.set_ylabel(y_label if y_label else _humanize_y_label(y_col))
+            elif is_pre_aggregated:
+                plot_df = df.sort_values(by=x_col)
+                plot_df.plot(x=x_col, y=y_col, kind="area", ax=ax, alpha=0.4, color=COLORBLIND_PALETTE[0])
+                ax.set_ylabel(y_label if y_label else _humanize_y_label(y_col))
+            else:
+                if y_col and y_col in df.columns:
+                    plot_df = df.sort_values(by=x_col)
+                    plot_df.plot(x=x_col, y=y_col, kind="area", ax=ax, alpha=0.4, color=COLORBLIND_PALETTE[0])
+                    ax.set_ylabel(y_label if y_label else _humanize_y_label(y_col))
+                else:
+                    counts = df.groupby(x_col).size().reset_index(name="count")
+                    counts = counts.sort_values(by=x_col)
+                    counts.plot(x=x_col, y="count", kind="area", ax=ax, alpha=0.4, color=COLORBLIND_PALETTE[0])
+                    ax.set_ylabel(y_label if y_label else "Count")
+            ax.set_xlabel(x_col.replace("_", " ").title())
+
+        elif chart_type == "doughnut":
+            # Doughnut is pie with a white center circle
+            if series_col:
+                plot_df = df.groupby(x_col)[y_col].sum().reset_index()
+                plot_df = plot_df.sort_values(by=y_col, ascending=False).head(CHART_PIE_MAX_SLICES)
+            elif is_pre_aggregated:
+                plot_df = df.head(CHART_PIE_MAX_SLICES)
+                if len(df) > CHART_PIE_MAX_SLICES:
+                    top = _safe_sort_numeric(df, y_col, ascending=False).nlargest(CHART_PIE_MAX_SLICES - 1, y_col)
+                    other_val = df.iloc[CHART_PIE_MAX_SLICES - 1:][y_col].sum()
+                    other_row = pd.DataFrame([{x_col: "Other", y_col: other_val}])
+                    plot_df = pd.concat([top, other_row], ignore_index=True)
+            else:
+                value_counts = df[x_col].value_counts()
+                if len(value_counts) > CHART_PIE_MAX_SLICES:
+                    top = value_counts.nlargest(CHART_PIE_MAX_SLICES - 1)
+                    other = value_counts.iloc[CHART_PIE_MAX_SLICES - 1:].sum()
+                    if other > 0:
+                        top["Other"] = other
+                    value_counts = top
+                plot_df = value_counts.reset_index()
+                plot_df.columns = [x_col, y_col or "count"]
+
+            colors = _apply_colorblind_palette(ax, "pie", len(plot_df))
+            wedges, texts, autotexts = ax.pie(
+                plot_df[y_col if y_col and y_col in plot_df.columns else "count"],
+                labels=plot_df[x_col],
+                autopct="%1.1f%%",
+                startangle=90,
+                colors=colors,
+                wedgeprops=dict(width=0.4, edgecolor="w"),
+            )
+            ax.set_ylabel("")
+
+        elif chart_type == "radar":
+            # Radar chart: one axis per category, values plotted on radial axes.
+            # Best for comparing entities across multiple metrics (e.g., departments
+            # across diversity, engagement, retention scores).
+            if not x_col or not y_col:
+                logger.warning("CHART_DEBUG_MATPLOTLIB: radar needs x_column and y_column")
+                plt.close(fig)
+                return ""
+            # Aggregate to one value per x category (sum if multiple rows per category)
+            plot_df = df.groupby(x_col, as_index=False)[y_col].sum().sort_values(by=x_col)
+            categories = plot_df[x_col].astype(str).tolist()
+            values = plot_df[y_col].tolist()
+            # Close the loop
+            values += values[:1]
+            angles = [n / len(categories) * 2 * 3.141592653589793 for n in range(len(categories))]
+            angles += angles[:1]
+
+            ax = fig.add_subplot(111, projection="polar")
+            ax.plot(angles, values, "o-", linewidth=2, label=y_label or _humanize_y_label(y_col))
+            ax.fill(angles, values, alpha=0.25)
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(categories, fontsize=9)
+            ax.set_title(chart_title)
+            ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.0))
+
         else:
             logger.warning("Unknown chart type: %s", chart_type)
             plt.close(fig)
@@ -1126,6 +1417,7 @@ def generate_chart(
     _retry_count: int = 0,
     multi_series: bool = False,
     metrics: Optional[List[str]] = None,
+    tenant_id: Optional[str] = None,
 ) -> str:
     """
     Generate a chart in the configured mode.
@@ -1143,6 +1435,9 @@ def generate_chart(
         logger.info("Employee role: suppressing chart, returning table only.")
         return generate_data_table(data) if include_table else ""
 
+    # Translate enum codes to descriptions for display
+    data = translate_codes_for_display(data, tenant_id)
+
     mode = (mode or CHART_MODE).lower()
     logger.info("CHART_DEBUG_GENERATE: mode=%s type=%s data_rows=%d", mode, chart_type, len(data))
 
@@ -1158,12 +1453,14 @@ def generate_chart(
                 chart_type = "bar"
 
     if mode == "auto":
-        if chart_type in ("bar", "barh", "pie", "line") and len(data) <= CHART_MAX_CATEGORIES:
+        if chart_type in ("bar", "barh", "pie", "doughnut", "line") and len(data) <= CHART_MAX_CATEGORIES:
             mode = "mermaid"
         else:
             mode = "matplotlib"
 
-    # Defensive guard: Mermaid only supports bar, barh, pie, line
+    # Defensive guard: Mermaid only supports bar, barh, pie, line.
+    # (doughnut is NOT supported by Mermaid pie syntax -- it falls through
+    # to matplotlib below, same as scatter/heatmap/area.)
     if mode == "mermaid" and chart_type not in ("bar", "barh", "pie", "line"):
         logger.warning("Chart type '%s' not supported in mermaid mode, switching to matplotlib", chart_type)
         mode = "matplotlib"
@@ -1173,6 +1470,10 @@ def generate_chart(
 
     # Multi-series reports require matplotlib for proper legend/scale handling.
     if multi_series and mode != "base64":
+        mode = "matplotlib"
+
+    # Scatter, heatmap, area, doughnut require matplotlib
+    if chart_type in ("scatter", "heatmap", "area", "doughnut") and mode == "mermaid":
         mode = "matplotlib"
 
     if mode == "mermaid":
@@ -1212,6 +1513,7 @@ def generate_chart(
             gauge_threshold=gauge_threshold,
             trend_line=trend_line,
             _retry_count=_retry_count + 1,
+            tenant_id=tenant_id,
         )
 
     logger.info("CHART_DEBUG_GENERATE: result_len=%d empty=%s", len(result), result == "")

@@ -236,6 +236,9 @@ def normalize_field_names(args: Dict, cached_schema: Any) -> None:
 
         joined = "".join(result)
 
+        # Step 1.5: strip SQL-isms (tautologies like 1=1, bare year() pseudo-fields)
+        joined = _sanitize_sql_isms(joined, field_map, field_types, cached_schema, entity_name)
+
         # Step 2: type-aware quote stripping on numeric fields
         joined = _strip_quotes_on_numeric_fields(joined, field_types)
 
@@ -255,7 +258,12 @@ def normalize_field_names(args: Dict, cached_schema: Any) -> None:
 
     filter_val = args.get("filter")
     if filter_val and isinstance(filter_val, str):
-        args["filter"] = _correct_filter(filter_val)
+        normalized = _correct_filter(filter_val)
+        if normalized and normalized.strip():
+            args["filter"] = normalized
+        else:
+            # Filter collapsed entirely to a SQL tautology (e.g. "1=1") -> drop it.
+            args.pop("filter", None)
 
     orderby_val = args.get("orderby")
     if orderby_val:
@@ -279,7 +287,143 @@ def normalize_field_names(args: Dict, cached_schema: Any) -> None:
 
     having_val = args.get("having")
     if having_val and isinstance(having_val, str):
-        args["having"] = _correct_filter(having_val)
+        normalized = _correct_filter(having_val)
+        if normalized and normalized.strip():
+            args["having"] = normalized
+        else:
+            args.pop("having", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL-ism Sanitization (internal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# SQL-style tautologies the LLM sometimes emits. OData $filter does not support
+# bare boolean literals, so ``1=1`` / ``1=0`` / ``0=0`` are syntax errors in DAB.
+_SQL_TAUTOLOGY = re.compile(r"\(\s*1\s*=\s*[01]\s*\)|1\s*=\s*[01]|0\s*=\s*0", re.IGNORECASE)
+
+# Bare "year" used as a pseudo-field (SQL-style YEAR() function) in $filter,
+# e.g. ``year eq 2026``. OData has no bare ``year`` field operator; this must be
+# rewritten against a real date column when "year" is not an actual schema field.
+_YEAR_PSEUDO_FIELD = re.compile(r"\byear\b\s+(eq|ne|ge|le|gt|lt)\s+(\d{4})\b", re.IGNORECASE)
+
+
+def _strip_sql_tautologies(filter_str: str) -> str:
+    """Remove SQL tautologies such as ``1=1`` / ``1 = 1`` / ``1=0`` / ``0=0``.
+
+    These are common SQL artifacts the LLM emits but OData $filter does not
+    support bare boolean literals. Removes the tautology and cleans up the
+    dangling ``and``/``or`` connector so the remaining expression stays valid.
+    Returns an empty string if the whole filter collapses to a tautology.
+    """
+    s = filter_str
+    while True:
+        new = _SQL_TAUTOLOGY.sub("", s)
+        # Drop connectors left dangling by the removal.
+        new = re.sub(r"\s*\b(and|or)\b\s*\b(and|or)\b\s*", " and ", new, flags=re.I)
+        new = re.sub(r"^\s*\b(and|or)\b\s+", "", new, flags=re.I)
+        new = re.sub(r"\s+\b(and|or)\b\s*$", "", new, flags=re.I)
+        new = re.sub(r"\s+", " ", new).strip()
+        if new == s:
+            break
+        s = new
+    return s
+
+
+def _find_date_field_for_year(entity_name: str, cached_schema: Any) -> Optional[str]:
+    """Pick a date-typed field to convert a bare ``year eq N`` pseudo-filter into
+    a real date-range.
+
+    Prefers a field whose name hints at the 'year' the user means
+    (join/effective/start/hire/resign), otherwise the first date-typed field.
+    Returns ``None`` when the entity has no date-typed column.
+    """
+    entity_data = _resolve_entity_data(entity_name, cached_schema)
+    if not isinstance(entity_data, dict):
+        return None
+
+    date_fields: List[str] = []
+    for f in entity_data.get("fields", entity_data.get("columns", [])):
+        if not isinstance(f, dict):
+            continue
+        name = f.get("name", "")
+        ftype = (f.get("type", "") or "").lower()
+        if not name:
+            continue
+        if "date" in ftype or "datetime" in ftype:
+            date_fields.append(name)
+    if not date_fields:
+        return None
+
+    # Prefer a field whose name suggests the 'year' the user means.
+    for hint in ("join", "effective", "start", "hire", "resign"):
+        for df in date_fields:
+            if hint in df.lower():
+                return df
+    return date_fields[0]
+
+
+def _convert_year_pseudo_field(
+    filter_str: str,
+    field_map: Dict[str, str],
+    cached_schema: Any,
+    entity_name: str,
+) -> str:
+    """Convert a bare ``year eq N`` pseudo-filter (SQL-style YEAR() function) into
+    a valid OData date-range when ``year`` is NOT a real field on the entity.
+
+    If ``year`` is a real column (e.g. ``v_employee_leave_summary.year``), the
+    filter is already valid OData and is returned unchanged.
+    """
+    if "year" in field_map:  # real field -> valid OData, leave alone
+        return filter_str
+
+    date_field = _find_date_field_for_year(entity_name, cached_schema)
+    if not date_field:
+        logger.warning(
+            "Cannot convert 'year' pseudo-filter: no YEAR column and no date field on %s",
+            entity_name,
+        )
+        return filter_str
+
+    def _replace(match: re.Match) -> str:
+        op = match.group(1).lower()
+        year = match.group(2)
+        if op == "eq":
+            return f"{date_field} ge {year}-01-01 and {date_field} le {year}-12-31"
+        if op == "ge":
+            return f"{date_field} ge {year}-01-01"
+        if op == "le":
+            return f"{date_field} le {year}-12-31"
+        return match.group(0)
+
+    new = _YEAR_PSEUDO_FIELD.sub(_replace, filter_str)
+    if new != filter_str:
+        logger.info(
+            "Filter SQL-ism fixed: '%s' -> '%s' (year pseudo-field -> %s date range)",
+            filter_str, new, date_field,
+        )
+        record_entity_normalized("filter_year_pseudo", filter_str, new)
+    return new
+
+
+def _sanitize_sql_isms(
+    filter_str: str,
+    field_map: Dict[str, str],
+    field_types: Dict[str, str],
+    cached_schema: Any,
+    entity_name: str,
+) -> str:
+    """Strip SQL tautologies and translate bare ``year`` pseudo-fields.
+
+    Runs after field-name case correction. Returns an empty string when the
+    filter collapses entirely to a tautology.
+    """
+    s = _strip_sql_tautologies(filter_str)
+    if not s:
+        return s
+    s = _convert_year_pseudo_field(s, field_map, cached_schema, entity_name)
+    return s
 
 
 # ─────────────────────────────────────────────────────────────────────────────

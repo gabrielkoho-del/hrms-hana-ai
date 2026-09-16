@@ -18,6 +18,9 @@ class AuthContext:
         self.internal_roles: List[str] = []
         self.permissions: Set[str] = set()
         self.raw_groups: List[str] = []
+        # Raw bearer token for the request; forwarded to DAB so DAB can
+        # authorize the caller's role (e.g. HRMS_EMPLOYEE) on writes.
+        self.token: Optional[str] = None
 
     def __repr__(self):
         return (
@@ -72,6 +75,7 @@ def validate_jwt(token: str) -> AuthContext:
 
         ctx.authenticated = True
         ctx.tenant_id = tenant_id
+        ctx.token = token
         ctx.user_id = payload.get("oid") or payload.get("sub")
         ctx.email = payload.get("email") or payload.get("upn") or payload.get("preferred_username")
         # EMPLOYEE_ID is stored as string in JWT to preserve leading zeros (e.g., '000024')

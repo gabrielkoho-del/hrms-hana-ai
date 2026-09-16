@@ -131,7 +131,7 @@ class CodeResolver:
         import asyncio
 
         try:
-            client = await dab_manager.get_client_async(self.tenant_id)
+            client = await dab_manager.get_client_async(self.tenant_id, role="HRMS_HR")
             
             all_codes = []
             after_cursor = None
@@ -188,43 +188,136 @@ class CodeResolver:
             if not self._reverse_index:
                 self._reverse_index = {}
 
-    def _extract_items(self, result: dict) -> Tuple[List[Dict], int, bool, Optional[str]]:
-        """Extract items list, count, has_more, and next cursor from DAB response."""
+    def _extract_items(self, result: dict, page_size: int = 1000) -> Tuple[List[Dict], int, bool, Optional[str]]:
+        """Extract items list, count, has_more, and next cursor from DAB response.
+        
+        Handles two DAB response shapes:
+          1. MCP wrapper:  {"content": [{"type": "text", "text": "{JSON}"}], "isError": bool}
+          2. Direct DAB:   {"value": [...], "@odata.nextLink": "..."}
+        """
         items = []
         has_more = False
         next_cursor = None
 
-        if isinstance(result, dict):
-            # MCP wrapper
-            content = result.get("content", [])
-            if content and isinstance(content, list):
-                first = content[0] if len(content) > 0 else {}
-                if isinstance(first, dict) and "text" in first:
-                    try:
-                        inner = json.loads(first["text"])
-                        items = inner.get("value", inner.get("items", inner.get("result", [])))
-                        # Check for nextLink to determine if more pages exist (cursor-based pagination)
-                        next_link = inner.get("@odata.nextLink")
-                        has_more = next_link is not None and len(items) >= page_size
-                        if next_link:
-                            match = re.search(r'\$after=([^&]+)', next_link)
-                            next_cursor = match.group(1) if match else None
-                    except (json.JSONDecodeError, TypeError):
-                        pass
+        if not isinstance(result, dict):
+            logger.warning("CodeResolver: unexpected result type %s", type(result).__name__)
+            return items, 0, has_more, next_cursor
+
+        # MCP content wrapper: unwrap the text envelope
+        content = result.get("content", [])
+        if content and isinstance(content, list) and len(content) > 0:
+            first = content[0]
+            if isinstance(first, dict) and first.get("type") == "text" and "text" in first:
+                try:
+                    inner = json.loads(first["text"])
+                    # DAB embeds isError inside the inner JSON too
+                    if inner.get("isError"):
+                        logger.warning(
+                            "CodeResolver: DAB error response: %s",
+                            str(inner.get("message", inner))[:200]
+                        )
+                        return items, 0, has_more, next_cursor
+                    # DAB REST wraps data in inner.result.value (OData format).
+                    # Fallback chain handles all known shapes.
+                    items = (
+                        inner.get("result", {}).get("value")
+                        or inner.get("value")
+                        or inner.get("items")
+                        or []
+                    )
+                    # DAB MCP pagination uses an opaque "after" cursor in
+                    # result (no @odata.nextLink). Its presence means more
+                    # pages exist; its absence means this page is the last.
+                    after_cursor = (
+                        inner.get("result", {}).get("after")
+                        or inner.get("after")
+                    )
+                    next_link = inner.get("result", {}).get("@odata.nextLink") or inner.get("@odata.nextLink")
+                    if after_cursor:
+                        has_more = True
+                        next_cursor = after_cursor
+                    elif next_link:
+                        has_more = len(items) >= page_size
+                        match = re.search(r'\$after=([^&]+)', next_link)
+                        next_cursor = match.group(1) if match else None
+                    logger.debug(
+                        "CodeResolver: extracted %d items, has_more=%s, next_cursor=%s",
+                        len(items), has_more, next_cursor
+                    )
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(
+                        "CodeResolver: failed to parse MCP content text: %s result_keys=%s",
+                        e, list(result.keys())
+                    )
+                    return items, 0, has_more, next_cursor
             else:
-                # Direct DAB response
-                items = result.get("value", result.get("items", result.get("result", [])))
-                has_more = result.get("@odata.nextLink") is not None
-                if has_more:
-                    next_link = result.get("@odata.nextLink", "")
-                    match = re.search(r'\$after=([^&]+)', next_link)
-                    next_cursor = match.group(1) if match else None
+                logger.warning(
+                    "CodeResolver: content[0] unexpected shape: type=%s keys=%s",
+                    first.get("type") if isinstance(first, dict) else type(first).__name__,
+                    list(first.keys()) if isinstance(first, dict) else "N/A"
+                )
+        else:
+            # Direct DAB response (no MCP wrapper)
+            items = (
+                result.get("result", {}).get("value")
+                or result.get("value")
+                or result.get("items")
+                or []
+            )
+            after_cursor = (
+                result.get("result", {}).get("after")
+                or result.get("after")
+            )
+            next_link = result.get("result", {}).get("@odata.nextLink") or result.get("@odata.nextLink")
+            if after_cursor:
+                has_more = True
+                next_cursor = after_cursor
+            elif next_link:
+                has_more = True
+                match = re.search(r'\$after=([^&]+)', next_link)
+                next_cursor = match.group(1) if match else None
+            logger.debug(
+                "CodeResolver: direct DAB response: %d items, has_more=%s",
+                len(items), has_more
+            )
 
         return items, len(items), has_more, next_cursor
+
+    def get_cached_reverse_index(self) -> Dict[str, List[Tuple[str, str]]]:
+        """Return cached reverse index without refreshing. Safe for sync callers."""
+        return self._reverse_index
 
     def resolve_code(self, code_value: str) -> List[Tuple[str, str]]:
         """Lookup code value in reverse index. Returns list of (type, description) tuples."""
         return self._reverse_index.get(str(code_value).strip(), [])
+
+    def resolve_description(self, description: str) -> List[Tuple[str, str]]:
+        """Forward lookup: resolve a human description back to code(s).
+
+        E.g., "married" → [("MARITAL_STATUS", "M")]
+        Uses case-insensitive partial matching against all descriptions.
+        """
+        results: List[Tuple[str, str]] = []
+        desc_lower = description.lower().strip()
+
+        for code, type_desc_pairs in self._reverse_index.items():
+            for code_type, desc in type_desc_pairs:
+                if desc_lower == desc.lower() or desc_lower in desc.lower():
+                    results.append((code_type, code))
+
+        return results
+
+    def resolve_code_type(self, code_type: str) -> Dict[str, str]:
+        """Get all codes for a specific type.
+
+        E.g., resolve_code_type("MARITAL_STATUS") → {"M": "Married", "S": "Single", ...}
+        """
+        result: Dict[str, str] = {}
+        for code, type_desc_pairs in self._reverse_index.items():
+            for ct, desc in type_desc_pairs:
+                if ct.upper() == code_type.upper():
+                    result[code] = desc
+        return result
 
 # ─────────────────────────────────────────────────────────
 # SCANNER
@@ -258,8 +351,27 @@ async def scan_for_codes(
         if not isinstance(tool_output, dict):
             continue
         
-        # Extract data items
-        raw_data = tool_output.get("result", tool_output.get("value", tool_output.get("items", [])))
+        # Extract data items. DAB result shapes vary by tool:
+        #   - aggregate_records (non-paginated): {"result": [row, ...]}
+        #   - aggregate_records (paginated):     {"result": {"items": [...], ...}}
+        #   - read_records OData wrapper:         {"result": {"value": [...]}}
+        result_val = tool_output.get("result")
+        if isinstance(result_val, list):
+            raw_data = result_val
+        elif isinstance(result_val, dict):
+            raw_data = (
+                result_val.get("value")
+                or result_val.get("items")
+                or tool_output.get("value")
+                or tool_output.get("items")
+                or []
+            )
+        else:
+            raw_data = (
+                tool_output.get("value")
+                or tool_output.get("items")
+                or []
+            )
         if not isinstance(raw_data, list):
             continue
 
